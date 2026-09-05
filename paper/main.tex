@@ -1,0 +1,258 @@
+% Risk-Aware Multi-Criteria Selective Prediction
+% IEEE conference paper skeleton, per project_plan.md §10.
+%
+% NOTE: this uses the generic `IEEEtran.cls` (conference mode), fetched from
+% CTAN. The project plan's submission checklist (§10) explicitly warns that
+% venue-specific IEEE templates differ -- swap in the exact template for
+% your target venue before submission. This environment has no LaTeX
+% toolchain installed, so this file has been written carefully by hand but
+% NOT compiled; compile it yourself (Overleaf or a local TeX Live install)
+% before trusting it.
+\documentclass[conference]{IEEEtran}
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{xcolor}
+
+\newcommand{\todo}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+
+\begin{document}
+
+\title{Risk-Aware Multi-Criteria Selective Prediction}
+
+\author{
+  \IEEEauthorblockN{Yash Kale}
+  \IEEEauthorblockA{\todo{Department, Institution, City, Country}\\
+  Email: yash.kale@uptiq.ai}
+}
+
+\maketitle
+
+\begin{abstract}
+Selective classifiers abstain on inputs they are unlikely to classify
+correctly, trading coverage for reliability. The dominant heuristic --
+thresholding the base model's maximum softmax probability (Chow's rule) --
+is Bayes-optimal only when the model's posteriors are correct, an
+assumption broken by miscalibration, distribution shift, and epistemic
+uncertainty. We study whether aggregating a heterogeneous bank of
+uncertainty signals (calibrated confidence, ensemble disagreement, an
+energy/OOD score, and feature-space geometry) with a learned,
+coverage-targeted aggregator improves the accuracy-coverage trade-off over
+the best single signal, and whether any such advantage is regime-dependent
+(tied in-distribution, larger under shift and at low coverage). We further
+wrap the resulting score in a distribution-free conformal risk-control
+layer and audit the approach for subgroup disparity. \todo{Fill in once
+Table~\ref{tab:aurc_summary} and the shift results (§9 week 9) are final --
+state the headline number here, not before.}
+\end{abstract}
+
+\begin{IEEEkeywords}
+selective classification, uncertainty quantification, conformal prediction, abstention, OOD detection
+\end{IEEEkeywords}
+
+\section{Introduction}
+\label{sec:intro}
+
+Chow's rule~\cite{chow1970} -- abstain when the maximum predicted
+posterior falls below a threshold -- is the Bayes-optimal selective
+classifier \emph{if} the model's posteriors are the true class posteriors.
+They rarely are: neural and tree-based classifiers are commonly
+miscalibrated~\cite{guo2017calibration}, behave unpredictably on
+out-of-distribution inputs~\cite{liu2020energy}, and carry epistemic
+uncertainty that a single forward pass cannot express. A large benchmark
+of selective-classification methods across dozens of datasets found that
+no single method dominates across operating points and
+objectives~\cite{benchmark2024}, which is the central motivation for an
+\emph{adaptive}, multi-signal approach rather than one more single-signal
+heuristic.
+
+At the same time, a well-tuned softmax-confidence baseline is a
+notoriously strong competitor: several recent studies show that elaborate
+learned-abstention methods fail to beat it
+in-distribution~\cite{feng2023better}, and that cheap post-hoc fixes (
+temperature scaling, logit normalization) recover much of the claimed gain
+of heavier methods~\cite{cattelan2023logitnorm}. We treat this as a
+falsifiable prediction rather than a threat to route around: we
+pre-register (\S\ref{sec:rq}) that any advantage from aggregation is
+\emph{regime-dependent} -- small or absent in-distribution, and larger
+under distribution shift and at low coverage, where a single signal's
+blind spots matter most.
+
+\textbf{Contributions.}
+\begin{enumerate}
+  \item A post-hoc, model-agnostic multi-criteria abstention framework
+    requiring no retraining of the base model.
+  \item A coverage-targeted training objective for the aggregator, shown
+    to \todo{outperform / tie -- report the actual A1-vs-A2 result once
+    final} correctness-classification training in the low-coverage
+    regime.
+  \item An instance-adaptive signal weighting mechanism, with analysis of
+    which signals dominate in which failure regime.
+  \item Distribution-free selective-risk control via a conformal wrapper,
+    evaluated across tabular and image benchmarks including distribution
+    shift and subgroup disparity.
+\end{enumerate}
+
+\subsection{Research questions}
+\label{sec:rq}
+\textbf{RQ1.} Does aggregating heterogeneous uncertainty signals improve
+the accuracy-coverage trade-off over the best single-signal abstention
+rule?
+\textbf{RQ2.} Is that advantage regime-dependent -- roughly tied with
+confidence thresholding in-distribution, clearly better under shift and at
+low coverage?
+\textbf{RQ3.} Can the learned score be wrapped in a finite-sample
+guarantee on selective risk without losing coverage relative to a
+heuristic threshold?
+\textbf{RQ4.} Does multi-criteria abstention reduce the concentration of
+abstentions (and residual error) on minority subgroups documented by prior
+work~\cite{jones2021disparities}?
+
+\section{Related work}
+\label{sec:related}
+\todo{Expand into full prose once the gap table
+(\texttt{paper/related\_work\_gap\_table.md}) is populated with verified
+citations. Every entry in that table must be checked against IEEE
+Xplore/arXiv/Semantic Scholar before being cited here -- see the caution
+in project\_plan.md \S2.}
+
+\subsection{Selective classification foundations}
+\cite{chow1970, geifman2017selective, elyaniv2010foundations}
+
+\subsection{Learned abstention}
+\cite{geifman2019selectivenet, liu2019deepgamblers, corbiere2019confidnet, huang2020sat, mozannar2020defer, moon2020crl}
+
+\subsection{The strong-baseline literature}
+\cite{feng2023better, cattelan2023logitnorm}
+
+\subsection{Fairness in selective classification}
+\cite{jones2021disparities}
+
+\subsection{Uncertainty and OOD signal sources}
+\cite{guo2017calibration, lakshminarayanan2017ensembles, gal2016dropout, liu2020energy, lee2018mahalanobis, sun2022knn, jiang2018trustscore, huang2021gradnorm}
+
+\subsection{Conformal prediction and risk control}
+\cite{vovk2005conformal, angelopoulos2022riskcontrol, angelopoulos2021learnthentest, angelopoulos2021gentle}
+
+\todo{Close this section with the gap table (columns: method, signals
+used, needs retraining?, guarantee?, evaluated under shift?, subgroup
+analysis?) as a compact figure/table -- the empty cells are the paper's
+justification.}
+
+\section{Preliminaries}
+\label{sec:prelim}
+Let $f$ be a fixed, frozen $K$-class base classifier and $g: \mathcal{X}
+\to \{0,1\}$ a selection function; $(f,g)$ abstains on $x$ when $g(x)=0$.
+\textbf{Coverage} is $\Pr[g(x)=1]$. \textbf{Selective risk} is the error
+rate of $f$ restricted to the accepted region,
+$R(f,g) = \mathbb{E}[\ell(f(x),y) \cdot g(x)] / \mathbb{E}[g(x)]$.
+The \textbf{risk-coverage curve} plots selective risk as a function of the
+target coverage achieved by thresholding a score $s(x)$; \textbf{AURC} is
+its area, and \textbf{E-AURC} subtracts the AURC of the best achievable
+(oracle) ordering, which controls for the confounding effect of base
+accuracy when aggregating across datasets~\cite{geifman2017selective}.
+
+\section{Method}
+\label{sec:method}
+
+\subsection{Signal bank}
+Given $x$, we compute $u(x) \in \mathbb{R}^m$ from four tiers: (A)
+logit-derived signals available from a single forward pass -- max softmax
+probability, entropy, margin, negative energy, logit-norm-normalized MSP,
+temperature-scaled MSP; (B) model-internal signals requiring multiple
+forward passes or an ensemble -- vote entropy, mean pairwise KL, top-class
+variance; (C) representation/data-geometry signals requiring the training
+set at inference -- $k$NN distance, local label agreement, trust
+score~\cite{jiang2018trustscore}, Mahalanobis distance to the predicted
+class centroid~\cite{lee2018mahalanobis}. \todo{Add Tier D
+(tree-specific) signals if/when GBM-internal disagreement signals are
+implemented -- currently out of scope, see PROJECT\_STATUS.md.}
+
+\subsection{Aggregator}
+We compare three aggregator classes of increasing expressiveness: A0, a
+learning-free rank/z-score average; A1, logistic regression or LightGBM
+stacked on $u(x)$ to predict $\mathbf{1}[f(x)\neq y]$ (ordinary stacking);
+and A2, the same function class as A1 trained instead with a
+coverage-targeted loss (\S\ref{sec:loss}).
+
+\subsection{Coverage-targeted loss}
+\label{sec:loss}
+Let $g(x) = \sigma((\tau - s(x))/T)$ be a soft acceptance gate. We
+minimize
+\begin{equation}
+\mathcal{L}_\kappa = \frac{\sum_i g(x_i)\,\ell(f(x_i),y_i)}{\sum_i g(x_i)}
+  + \lambda \max(0, \kappa - \tfrac{1}{n}\textstyle\sum_i g(x_i))^2,
+\end{equation}
+with $\tau$ a learned threshold, which trains the aggregator to rank well
+\emph{at the coverage the system is actually deployed at} rather than for
+correctness-classification accuracy overall. We also report an AURC
+surrogate (summing $\mathcal{L}_\kappa$ over a coverage grid) and a
+pairwise ranking loss (logistic loss on $s(\text{incorrect}) -
+s(\text{correct})$ margins).
+
+\subsection{Instance-adaptive signal weighting}
+A gating network $w(x) = \mathrm{softmax}(h(u(x)))$ produces
+per-instance weights over the (standardized) signals, $s(x) =
+\sum_j w_j(x)\, \tilde u_j(x)$, so the model can route to different
+signals for different failure regimes (e.g. Mahalanobis distance for
+far-OOD inputs, local label agreement for ambiguous in-distribution ones).
+
+\subsection{Conformal risk-control wrapper}
+On a held-out calibration set of size $n$, we select the largest threshold
+$\hat\tau$ such that a finite-sample upper confidence bound on selective
+risk stays below a user target $\alpha$, giving
+$\Pr[R(f, g_{\hat\tau}) \le \alpha] \ge 1-\delta$ under exchangeability,
+independent of how the aggregator was trained. This guarantee is valid
+in-distribution; under distribution shift, exchangeability fails and the
+guarantee is evaluated empirically rather than claimed.
+
+\section{Experimental setup}
+\label{sec:setup}
+\todo{Datasets (Table~\ref{tab:datasets}), base models, splits and
+cross-fitting, baselines, metrics, statistical protocol -- fill in from
+\texttt{results/results.parquet} once the full 12-dataset, 10-seed sweep
+(project\_plan.md \S9 week 8) is complete. Current results cover
+\{adult, german\_credit\} at \{1, 5\} seeds -- see PROJECT\_STATUS.md for
+exact scope.}
+
+\section{Results}
+\label{sec:results}
+\todo{Main AURC/E-AURC table, risk-coverage figures, coverage-at-
+guaranteed-risk table, shift results, cost curves, CD diagram. Every
+number here must be generated by \texttt{scripts/make\_tables.py} /
+\texttt{scripts/make\_figures.py} querying \texttt{results/results.parquet}
+-- never hand-typed.}
+
+\section{Ablations and analysis}
+\label{sec:ablations}
+\todo{Leave-one-signal-out; signal-family-only; aggregator class; loss
+comparison (A1-vs-A2, the headline ablation for the "this is just
+stacking" objection); with/without conformal wrapper; naive-vs-cross-fit
+meta-fitting; meta-set-size sweep; signal correlation/PCA.}
+
+\section{Limitations}
+\label{sec:limitations}
+The conformal guarantee (\S\ref{sec:method}) assumes exchangeability and
+is therefore valid in-distribution only; Tier C signals require the
+training set at inference time, adding memory and latency cost; the
+meta-split needed to train the aggregator is itself a cost on small
+datasets (quantified by the meta-set-size ablation); and current results
+are tabular-and-CIFAR-scale, not ImageNet-scale.
+
+\section{Conclusion}
+\label{sec:conclusion}
+\todo{Write last, after Results is final.}
+
+\section*{Acknowledgment}
+\todo{Remove or anonymize for double-blind submission per the checklist in
+project\_plan.md \S10.}
+
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
