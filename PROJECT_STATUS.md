@@ -118,6 +118,208 @@ row (§1) rather than the best one, and needs the rest of the shift battery
 (Diabetes-130 temporal split, CIFAR-10/100-C) before generalizing beyond
 Electricity specifically.
 
+## Diabetes-130 added (second temporal-shift dataset, plan §4)
+
+`diabetes130` (OpenML did=4541, Strack et al. 2014) is now in the registry
+and runs end-to-end. It was verified before use the same way `electricity`
+was, and the checks mattered:
+
+  * **Row order is time.** `encounter_id` ascends with row order with only
+    4 inversions in 101,765 adjacent pairs, and all four sit inside the
+    first 8 rows. `is_temporal=True` is justified. (Both `monotonic=False`
+    and `Spearman=1.0` are true at once here, which looks contradictory
+    until you locate the inversions -- worth noting because the first
+    measurement of this looked like a bug and was not.)
+  * **`encounter_id` must be dropped from X, not merely ignored.** It is
+    monotone in time, so under a temporal split every test value lies
+    outside the training range: a tree model would read it as an explicit
+    time index and then degenerate into a single branch at deployment.
+    `patient_nbr` is dropped too (a bare identity to memorise, and itself
+    ~0.54 Spearman-correlated with row order), as is `weight` (96.9% `?`).
+    `loaders.py` gained a `drop_cols` argument that *errors* on a name not
+    present, so a typo cannot silently leave a leaking column in place.
+  * **Known caveat, deliberately not "fixed": patient recurrence.** 16,773
+    patients have more than one encounter (up to 40), so **19.3% of test
+    rows belong to a patient also present in D_train∪D_meta**. This is
+    patient-level leakage in the strict sense. It is kept because it is
+    also the real deployment situation for a readmission model -- you do
+    see returning patients -- and removing it would destroy the temporal
+    semantics that make this a shift dataset at all. A
+    first-encounter-only variant (n = 71,518) is the obvious robustness
+    check if a reviewer presses, and should be run before submission.
+  * **Target binarised** to the standard "readmitted within 30 days"
+    (`<30`) task via a new `positive_class` loader argument, keeping it
+    comparable with the other three binary datasets. The native target is
+    3-class (`NO` / `>30` / `<30`); the multiclass version is a
+    *high-value* future experiment precisely because it would break the
+    Tier-A rank degeneracy documented below -- with K >= 3 the Tier-A
+    signals stop being monotone transforms of each other, which is the
+    single most likely condition under which aggregation could beat MSP.
+  * **The shift is weak in label terms.** The `<30` rate drifts only from
+    0.109 to 0.106 across row-order deciles, and split positive rates run
+    0.1143 (train) to 0.1056 (test). Any covariate shift is not
+    accompanied by much label shift, so a null RQ2 result here is weaker
+    evidence than it would be on a dataset with a sharper drift. Say so
+    rather than counting it as a second independent confirmation.
+
+Split sanity check passed: train/meta/cal/test are contiguous,
+non-overlapping row ranges covering all 101,766 rows exactly once, with
+adjacent boundaries and no gaps.
+
+## Bugs found and fixed (the "betterment" pass)
+
+A dedicated review pass over the signal and aggregator code found seven
+real defects, four of them silently degrading every aggregator result
+reported above. All are fixed, each with a regression test in
+`tests/test_fixes.py` written against the *symptom* rather than the
+implementation. The pre-fix results are archived at
+`results/results_prefix_archive.parquet` so the before/after comparison
+can be re-derived rather than taken on trust.
+
+**1. `EnergySignal` measured class identity, not uncertainty.** The base
+wrappers emit binary logits in the `[0, s]` gauge, so
+`-logsumexp([0, s]) = -ln(1 + e^s)` is *monotonically decreasing in the
+margin* -- a rank-equivalent copy of `P(class 0)`. A confident class-0
+prediction (`s = -8`) scored `-0.0003` while the maximally uncertain
+boundary (`s = 0`) scored `-0.6931`, i.e. the confident prediction was
+ranked as *more* uncertain. This is why `signal_energy` came out **worse
+than random abstention** on Adult (AURC 0.1824 vs. random's 0.1284). Fixed
+by mean-centering the logits before the logsumexp, making energy symmetric
+in the margin and maximal at the boundary. Note the gauge, not the
+formula, was at fault: energy is not shift-invariant, so `[0, s]` was an
+arbitrary and wrong choice of coordinates for it.
+
+**2. `LogitNormMSPSignal` is mathematically degenerate for K = 2.** A
+softmax reads only logit *differences*, so at K = 2 the whole signal is
+the single scalar gap `s`; dividing by `||z||_p` removes exactly the
+overall scale, which at K = 2 *is* `|s|`, leaving only `sign(s)`. The
+pre-fix implementation returned the constant `0.2689` for every `s != 0`,
+which induces an arbitrary ordering -- hence its Friedman mean rank of
+20.0, *below random abstention's* 19.7. Every candidate repair collapses
+identically (measured: centering -> constant 0.1956;
+`max_logit/||z||` on the raw gauge -> the binary indicator `1[s > 0]`;
+the same ratio on centered logits -> constant 0.7071), so the signal is
+now **excluded from the binary bank** and raises on binary input, while
+being kept unchanged for K >= 3 where the normalisation is well-defined.
+*This is worth a sentence in the paper*: Cattelan & Silva's logit
+normalisation is inapplicable to binary classification, which is a
+limitation of the published method rather than of this codebase.
+
+**3. `AdaptiveGatingAggregator` had no intercept.** The score was
+`logit(x) = w(x)^T z(x)` where `w` is a softmax (so it sums to 1) over a
+z-scored `z` (so zero-mean per column), which pins the mean logit near 0
+-- a predicted error probability of 0.5. With a base error rate of 10% the
+correct mean logit is `log(0.1/0.9) ~= -2.2`, and no parameter in the
+architecture could express it; the convex-combination constraint also caps
+the logit's range at `max_j z_j(x)`, so scaling could not compensate.
+Fixed with a learnable bias initialised at the meta-set log-odds.
+
+**4. The pairwise ranking loss (Loss 3) had bounded margins.** The caller
+passed `s = sigmoid(logit)`, confining the margin to (-1, 1), so
+`softplus(-margin)` could not fall below `softplus(-1) = 0.313` even for a
+*perfectly* separated ranking, and the gradient vanished exactly where the
+ranking was becoming confident. Now computed on the raw logit: unbounded
+margins, loss -> 0 for a correct ranking, healthy gradients. The optimised
+ranking is unchanged (sigmoid is monotone, so every pairwise sign is the
+same); only the loss surface differs.
+
+**5. The soft-selective-risk gate was too sharp to train through
+(`T = 0.05`).** `sigmoid((tau - s)/T)` is then a near-step function whose
+derivative falls below 0.018 once `|tau - s| > 0.2`; composed with the
+already-saturating sigmoid on `s`, almost no training point retained a
+usable gradient. Raised to `T = 0.5`.
+
+**6. The coverage penalty never bound (`lambda = 1.0`).** Missing a target
+coverage of 0.8 by a full 10 points cost `(0.1)^2 * 1.0 = 0.01`, against a
+selective-risk term of order 0.1-0.2, so a *coverage-targeted* objective
+could ignore its own coverage target essentially for free. Raised to 10.0.
+
+**7. `LogRegStackingAggregator` fed unstandardised features to an
+L2-regularised model.** Tier-A signals are probabilities in [0, 1] while
+Tier-C signals are raw distances reaching 1e3+, and L2 penalises
+coefficient magnitude -- so a small-scale feature needs a larger
+coefficient for the same influence and is penalised far more for it. The
+least-cost solution shrinks the *informative* probability signals towards
+zero and leans on the large-scale distance signals, exactly backwards
+(MSP is the strongest single signal in every dataset here;
+`knn_distance`/`mahalanobis` are among the weakest). Fixed with a
+`StandardScaler` pipeline. This also made the headline A1-vs-A2 comparison
+unfair to A1, since A2 already standardised its inputs.
+
+Additionally fixed, as robustness rather than correctness: `TrustScore`
+could return ~1e12 when a test point coincided with a training point of
+its predicted class, which alone dominated the z-score standardisation
+every aggregator applies (now clamped); `LocalLabelAgreement` could take
+only k+1 = 11 distinct values, forcing large blocks of ties that a
+risk-coverage curve must then traverse in arbitrary order (k raised to
+50); and the A2 training regime (300 full-batch steps, fixed lr, no
+schedule, no regularisation, no clipping) gained cosine annealing, 500
+epochs, dropout 0.1 and gradient clipping.
+
+### Tier B now runs at all
+
+`use_ensemble=True` previously crashed on an assertion and had therefore
+**never been exercised**. The cause was a column-set mismatch: the
+cross-fitted meta path deliberately excluded Tier B while the deployment
+path included it, so the aggregators would have trained on (A+C) columns
+and been scored on (A+B+C). Tier B's ensemble is now trained on
+**D_train only**, which makes one ensemble valid for scoring D_meta *and*
+D_cal/D_test (both disjoint from D_train), and its columns are grafted
+onto every split in one fixed order -- exactly like temperature scaling --
+so the meta and deployment feature spaces agree by construction. Verified
+end-to-end on German Credit with all three ensemble signals present.
+This does not cross-fit the ensemble (an ensemble-of-ensembles over
+K folds x M members remains out of scope); the cost is that the ensemble
+sees 60% of the data rather than 75%.
+
+### The finding that reframes the negative result
+
+Measured directly (`tests/test_fixes.py` pins it): **on a binary task,
+every Tier-A signal is a strictly monotone transform of every other one**
+-- MSP, entropy, both margins, temperature-scaled MSP, and even the
+*fixed* energy all have pairwise Spearman |rho| = 1.0000. Tier A therefore
+supplies exactly **one** distinct ranking, so no aggregator over Tier A
+alone can order abstentions any differently from MSP, no matter how it is
+trained. That is a structural explanation for the central negative result
+above, independent of any bug: the aggregators were never able to beat MSP
+in-distribution because five of their features carried no information the
+sixth did not already have, and two of the remaining ones were broken.
+
+Two consequences worth carrying into the paper:
+
+  * On binary problems the only genuinely different orderings come from
+    Tier B (ensemble disagreement), Tier C (geometry/density) and the new
+    `calib_residual` signal. Tier A is a single bit dressed as six
+    features. Any future "aggregate many uncertainty signals" claim needs
+    to state which of its signals are actually rank-independent.
+  * A new signal was added to break the degeneracy deliberately:
+    `CalibrationResidualSignal` fits an isotonic map
+    `confidence -> empirical accuracy` on a held-out split and scores
+    `|conf - iso(conf)|`, i.e. local miscalibration. Because `iso` is
+    monotone but crosses the identity line, the residual is V-shaped
+    rather than monotone in confidence -- measured Spearman against MSP is
+    0.25, the first Tier-A signal that is not rank-equivalent to it. It
+    adds no new *raw* information (it is a function of confidence alone),
+    but it adds *expressivity*: a monotone aggregator over `{conf}` can
+    only reproduce MSP's ordering, whereas given `conf` and the residual it
+    can express "in the confidence band where this model is systematically
+    overconfident, treat it as riskier" -- and the ideal ordering, by
+    `P(error | x)`, is genuinely non-monotone in reported confidence for a
+    miscalibrated model.
+
+### Results schema change
+
+`results/results.parquet` rows now carry a `tiers` column, and the
+idempotency key in `scripts/run_all.py` is
+`(dataset, base_model, tiers, seed)`. Without this an (A,B,C) run silently
+overwrote the (A,C) rows for the same dataset and seed -- they are
+different experiments -- and §7's signal-family-only ablation could not
+hold both side by side. `scripts/make_tables.py` now refuses to pool
+across tier configurations and takes a `--tiers` argument to pick one.
+The pre-schema parquet is archived at
+`results/results_prefix_archive.parquet`; `run_all.py` fails loudly rather
+than merging a file that predates the column.
+
 ## Deliberate simplifications (be honest about these, per the plan's own ethos)
 
 1. **Temperature scaling is not K-fold cross-fitted.** It's fit once, on
@@ -127,11 +329,16 @@ Electricity specifically.
    other Tier A/C signals, so its distribution on D_meta may differ
    slightly from model_final's (trained on D_train∪D_meta) behavior at
    deployment. Documented in `runner.py`'s module docstring.
-2. **Tier B (ensemble) is not cross-fitted at all.** `use_ensemble=True`
-   trains one ensemble on the full D_train∪D_meta pool for both meta-signal
-   computation and deployment scoring. Cross-fitting an ensemble-of-
-   ensembles (K folds × M members) is real additional engineering, out of
-   scope for this pass.
+2. **Tier B (ensemble) is not cross-fitted.** `use_ensemble=True` now
+   trains one ensemble on **D_train only** and uses it to score D_meta and
+   D_cal/D_test alike. Both are disjoint from D_train, so nothing is scored
+   in-sample and the meta/deployment feature spaces match by construction
+   -- but the ensemble sees 60% of the data rather than the 75% the other
+   deployment signals get. Cross-fitting an ensemble-of-ensembles (K folds
+   × M members) is real additional engineering, still out of scope. (This
+   replaced an arrangement that trained on D_train∪D_meta and included Tier
+   B only in the deployment path, which crashed -- see "Tier B now runs at
+   all" above.)
 3. **Conformal wrapper is intentionally simple, not tight.** Hoeffding's
    inequality + Bonferroni over a bounded quantile grid is auditable in
    ~130 lines but is provably loose at small target risk α (its variance-
@@ -155,15 +362,17 @@ Electricity specifically.
    `runner.py` if you need the finer test before submission.
 5. **Tier D (tree-specific) signals are not implemented.** Out-of-bag /
    boosting-round disagreement and leaf co-occurrence distance are listed
-   in the plan (§3.1) but not built here.
+   in the plan (§3.1) but not built here. Note this is now a more
+   interesting gap than it looked: since Tier A is provably a single
+   ranking on binary tasks, Tier D would be one of the few remaining
+   sources of a genuinely independent ordering.
 6. **No neural base model / MC-dropout / image datasets yet.** Everything
    above runs on tabular data with LightGBM/logreg. CIFAR-10/100 +
    ResNet-18/WideResNet, and the MC-dropout Tier-B source that requires a
    dropout-bearing network, are unstarted (plan explicitly allows dropping
    image experiments first under schedule pressure — §11).
-7. **3 of the planned 12 tabular datasets so far** (`adult`,
-   `german_credit` at 5 seeds each; `electricity`, the temporal-shift
-   dataset, now at 10 seeds). Everything is wired to scale to the full
+7. **4 of the planned 12 tabular datasets so far** (`adult`,
+   `german_credit`, `electricity` and `diabetes130`, all at 10 seeds). Everything is wired to scale to the full
    12-dataset registry in `src/data/loaders.py:REGISTRY` — just add
    entries and run `scripts/run_all.py dataset=<name>
    experiment.n_seeds=10`. Note that for a temporal dataset (`is_temporal=
@@ -178,11 +387,10 @@ Electricity specifically.
 ## Not started (still exactly as scoped in the plan)
 
 - Datasets: Bank Marketing, Give Me Some Credit, Covertype, MiniBooNE,
-  Higgs, Diabetes-130, Telco churn, ann-thyroid, Jannis/Road-Safety.
-- Shift experiments: Electricity now has a real 10-seed run (see above);
-  Diabetes-130 temporal split (the `Dataset.is_temporal` plumbing exists
-  in `src/data/splits.py` and would need a registry entry), CIFAR-10-C/
-  100-C, synthetic covariate shift are all still unrun.
+  Higgs, Telco churn, ann-thyroid, Jannis/Road-Safety.
+- Shift experiments: Electricity and Diabetes-130 both have real 10-seed
+  temporal-split runs (see above). CIFAR-10-C/100-C and synthetic
+  covariate shift are still unrun.
 - Published baselines requiring retraining: SelectiveNet, Deep Gamblers,
   ConfidNet.
 - Full ablation suite (§7): leave-one-signal-out, signal-family-only,

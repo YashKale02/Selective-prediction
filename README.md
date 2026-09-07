@@ -13,6 +13,39 @@ current account of what in the 14-week plan is implemented and verified
 end-to-end vs. still scaffolded/TODO — this README describes the system
 that exists; that file describes how far along it is.
 
+### Two findings worth knowing before you read any result here
+
+Both came out of the bug-fix pass described in
+[`betterment.md`](betterment.md) (which carries the same summary at the
+top) and are written up in full, with the measurements, under
+"Bugs found and fixed" in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+
+1. **On a binary task, every Tier-A signal is a monotone transform of
+   every other one.** MSP, entropy, both margins, temperature-scaled MSP
+   and even a correctly-fixed energy all have pairwise Spearman
+   |ρ| = 1.0000 — so Tier A supplies exactly **one** distinct ranking, and
+   *no aggregator over Tier A alone can order abstentions differently from
+   MSP*, however it is trained. This is a structural explanation for the
+   project's central negative result that is independent of any bug. On
+   binary problems the only genuinely independent orderings come from Tier
+   B (ensemble disagreement), Tier C (geometry/density) and the new
+   `calib_residual` signal.
+
+2. **Logit-norm MSP is mathematically degenerate for K = 2 and cannot be
+   repaired.** A softmax reads only logit *differences*, so at K = 2 the
+   whole signal is one scalar gap `s`; dividing by `‖z‖_p` removes exactly
+   the overall scale, which at K = 2 *is* `|s|`, leaving only `sign(s)`.
+   Every candidate repair was measured and each collapses to ≤2 distinct
+   values. It is now excluded from the binary bank rather than "fixed" —
+   which also means Cattelan & Silva's logit normalisation is
+   **inapplicable to binary classification**, a limitation of the
+   published method rather than of this code.
+
+Two of the twelve uncertainty signals were also outright broken before
+this pass, in ways that made them *worse than random abstention* while
+being fed as features into every aggregator. If you are comparing against
+numbers from an earlier commit, they are not trustworthy.
+
 ## Quickstart
 
 ```bash
@@ -42,11 +75,15 @@ anywhere except as a query against that file. `scripts/make_tables.py` and
 - **Base models** (`src/models/`): LightGBM and logistic-regression
   wrappers behind one interface (`fit` / `predict_proba` / `logits` /
   `features`), so every signal is model-agnostic.
-- **Signals** (`src/signals/`): Tier A (MSP, entropy, margin, energy,
-  logit-norm MSP, temperature-scaled MSP), Tier B (ensemble vote entropy,
-  mean pairwise KL, top-class variance), Tier C (kNN distance, local label
-  agreement, trust score, Mahalanobis distance). Tier D (tree-specific) is
-  not implemented — see PROJECT_STATUS.md.
+- **Signals** (`src/signals/`): Tier A (MSP, entropy, both margins,
+  energy, temperature-scaled MSP, and `calib_residual` — an isotonic
+  miscalibration residual, the only Tier-A signal that is *not*
+  rank-equivalent to MSP on a binary task; logit-norm MSP is included only
+  for K ≥ 3, see finding 2 above), Tier B (ensemble vote entropy, mean
+  pairwise KL, top-class variance — enabled with `signals=tier_a_b_c`),
+  Tier C (kNN distance, local label agreement, trust score, Mahalanobis
+  distance). Tier D (tree-specific) is not implemented — see
+  PROJECT_STATUS.md.
 - **Aggregators** (`src/aggregators/`): A0 (rank/z-score average, no
   learning), A1 (logistic regression / LightGBM stacking on correctness),
   A2 (a small MLP, and an instance-adaptive gating variant, both trained
@@ -74,8 +111,9 @@ anywhere except as a query against that file. `scripts/make_tables.py` and
 
 ## What's real vs. scaffolded — the short version
 
-Two real OpenML datasets (Adult, German Credit) have been run end-to-end,
-5 seeds each, through the entire pipeline including cross-fitting,
+Four real OpenML datasets (Adult, German Credit, Electricity and
+Diabetes-130, the latter two temporal-shift) have been run end-to-end at
+10 seeds each, through the entire pipeline including cross-fitting,
 conformal calibration, and the statistical tests — this is not a demo on
 synthetic data. The result on both matches the paper plan's own
 pre-registered prediction (§1, RQ2 and §11's risk register): **a properly

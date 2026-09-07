@@ -18,6 +18,21 @@ from sklearn.neighbors import NearestNeighbors
 
 from .base import Signal
 
+# Clamp for TrustScoreSignal's distance ratio. The ratio is unbounded above
+# (d_pred -> 0 for a test point sitting on a training point), and a single
+# ~1e12 row destroys the z-score standardisation every aggregator applies to
+# its inputs. 100 is far above the useful dynamic range: a point 100x closer
+# to its predicted class than to any other is already "maximally trusted",
+# and distinctions beyond that carry no information.
+TRUST_SCORE_CLAMP = 100.0
+
+# LocalLabelAgreementSignal returns a fraction over k neighbours and so can
+# only take k+1 distinct values; at k=10 that is 11 levels across the whole
+# dataset, which forces large blocks of ties whose internal order a
+# risk-coverage curve then has to traverse arbitrarily. 50 gives 51 levels
+# at negligible cost, since the neighbour index is already built.
+LOCAL_LABEL_AGREEMENT_K = 50
+
 
 class _TrainIndexedSignal(Signal):
     """Shared machinery: fit a k-NN index on D_train's feature
@@ -31,6 +46,10 @@ class _TrainIndexedSignal(Signal):
 
     def fit(self, X_train: pd.DataFrame, y_train: np.ndarray, model) -> "_TrainIndexedSignal":
         feats = model.features(X_train)
+        # Never request more neighbours than there are training rows -- a
+        # small dataset or a small cross-fitting fold would otherwise raise.
+        # Recorded on the instance so `_neighbors` queries the same k.
+        self.k = int(min(self.k, len(feats)))
         self.nn = NearestNeighbors(n_neighbors=self.k).fit(feats)
         self.y_train = np.asarray(y_train)
         self.n_classes = int(self.y_train.max()) + 1
@@ -59,9 +78,22 @@ class LocalLabelAgreementSignal(_TrainIndexedSignal):
     label (§3.1 item 14) — the one Tier-C signal that targets aleatoric
     rather than epistemic uncertainty (genuinely ambiguous regions of
     input space, not just far-from-training ones). Negated so higher score
-    = more uncertain (low local agreement with the model's own prediction)."""
+    = more uncertain (low local agreement with the model's own prediction).
+
+    Uses a larger `k` than the other Tier-C neighbour signals
+    (`LOCAL_LABEL_AGREEMENT_K`). This signal's output is a fraction over k
+    neighbours, so it can only take `k + 1` distinct values: at the shared
+    default of k=10 that is 11 levels for the whole dataset, which is coarse
+    enough to force large blocks of ties. Ties are actively harmful for a
+    risk-coverage curve, because the order *within* a tied block is
+    arbitrary and the curve has to walk through it blind. A larger k gives a
+    finer-grained ranking at negligible extra cost (the neighbour index is
+    already built)."""
 
     name = "local_label_agreement"
+
+    def __init__(self, k: int = None, **kwargs):
+        super().__init__(k=LOCAL_LABEL_AGREEMENT_K if k is None else k, **kwargs)
 
     def score(self, X: pd.DataFrame, model) -> np.ndarray:
         pred = model.predict_proba(X).argmax(axis=1)
@@ -105,6 +137,18 @@ class TrustScoreSignal(_TrainIndexedSignal):
         masked[np.arange(n), pred] = np.inf
         d_other = masked.min(axis=1)
         trust = d_other / np.clip(d_pred, 1e-12, None)
+        # Clamp before negating. When a test point coincides with (or nearly
+        # coincides with) a training point of its predicted class, d_pred is
+        # ~0 and the raw ratio explodes -- up to ~1e12 with the 1e-12 floor
+        # above. A single such row dominates the z-score standardisation
+        # every aggregator applies to its inputs (`_Standardizer` in
+        # a2_coverage_loss.py, `StandardScaler` in a1_stacking.py),
+        # compressing every other row of this column to near-zero and
+        # destabilising the torch aggregators' gradients. Clamping preserves
+        # the ordering everywhere except among the already-saturated
+        # "maximally trustworthy" rows, which are exactly the rows whose
+        # exact ratio carries no useful distinction.
+        trust = np.clip(trust, 0.0, TRUST_SCORE_CLAMP)
         return -trust
 
 

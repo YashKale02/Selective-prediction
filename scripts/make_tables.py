@@ -20,6 +20,7 @@ the finer-grained bootstrap before submission.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 import warnings
 from itertools import combinations
@@ -59,6 +60,8 @@ def aurc_summary_table(df: pd.DataFrame) -> pd.DataFrame:
         .rename(columns={"mean": "AURC_mean", "std": "AURC_std", "count": "n_seeds"})
         .reset_index()
     )
+    if "tiers" in aurc_rows.columns and aurc_rows.tiers.notna().any():
+        summary.insert(1, "tiers", aurc_rows.tiers.iloc[0])
     return summary
 
 
@@ -135,10 +138,49 @@ def friedman_and_nemenyi(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
     return result, note
 
 
+def select_tiers(df: pd.DataFrame, requested: str | None) -> pd.DataFrame:
+    """Restrict the results to a single signal-tier configuration.
+
+    Results for different tier configurations -- (A,C) vs. (A,B,C) -- are
+    different experiments that share the same (dataset, method, seed) keys.
+    Aggregating over them would silently average two experiments into one
+    number, so a tier configuration must be picked explicitly whenever the
+    parquet holds more than one.
+    """
+    if "tiers" not in df.columns:
+        raise SystemExit(
+            "results.parquet has no 'tiers' column; it predates the current "
+            "results schema. Re-run scripts/run_all.py to regenerate it."
+        )
+    available = sorted(df.tiers.dropna().unique())
+    if requested is None:
+        if len(available) > 1:
+            raise SystemExit(
+                f"results.parquet contains multiple signal-tier configs "
+                f"{available}; these are separate experiments and must not be "
+                f"pooled. Re-run with --tiers <one of {available}>."
+            )
+        requested = available[0]
+    elif requested not in available:
+        raise SystemExit(f"--tiers {requested!r} not in results; available: {available}")
+    print(f"[make_tables] signal tiers = {requested}")
+    return df[df.tiers == requested].copy()
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tiers",
+        default=None,
+        help="Signal-tier config to report on (e.g. 'AC', 'ABC'). Required "
+             "only when results.parquet holds more than one.",
+    )
+    args = parser.parse_args()
+
     if not RESULTS_PATH.exists():
         raise SystemExit(f"No results parquet at {RESULTS_PATH}. Run scripts/run_all.py first.")
     df = pd.read_parquet(RESULTS_PATH)
+    df = select_tiers(df, args.tiers)
 
     summary = aurc_summary_table(df)
     summary.to_csv(TABLE_DIR / "aurc_summary.csv", index=False)

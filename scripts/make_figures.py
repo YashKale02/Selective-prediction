@@ -9,6 +9,7 @@ Writes PNGs to paper/figures/.
 """
 from __future__ import annotations
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -21,6 +22,9 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from make_tables import select_tiers  # noqa: E402  (shared tier-selection guard)
 
 RESULTS_PATH = ROOT / "results" / "results.parquet"
 FIG_DIR = ROOT / "paper" / "figures"
@@ -74,9 +78,22 @@ def plot_risk_coverage(df: pd.DataFrame, dataset: str, ax) -> None:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--tiers",
+        default=None,
+        help="Signal-tier config to plot (e.g. 'AC', 'ABC'). Required only "
+             "when results.parquet holds more than one.",
+    )
+    args = parser.parse_args()
+
     if not RESULTS_PATH.exists():
         raise SystemExit(f"No results parquet at {RESULTS_PATH}. Run scripts/run_all.py first.")
     df = pd.read_parquet(RESULTS_PATH)
+    # Different tier configurations are different experiments sharing the
+    # same (dataset, method, seed) keys; averaging over them would silently
+    # blend two experiments into one curve.
+    df = select_tiers(df, args.tiers)
     datasets = sorted(df["dataset"].unique())
 
     fig, axes = plt.subplots(1, len(datasets), figsize=(6 * len(datasets), 5), squeeze=False)

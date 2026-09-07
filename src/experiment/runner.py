@@ -9,10 +9,12 @@ except as a query against [the results parquet]").
 Design choice, stated explicitly (this is the kind of simplification the
 project plan asks you to be honest about, not hide, §6/§7):
 
-  - `model_train`  : fit on D_train only. Used *only* to fit temperature
-                     scaling on D_meta (already honest by construction,
-                     since model_train never saw D_meta -- no cross-fitting
-                     needed for this one signal).
+  - `model_train`  : fit on D_train only. Used to fit every signal that
+                     needs data the base model has not seen -- temperature
+                     scaling and the isotonic calibration residual, both fit
+                     on D_meta -- and to train the Tier B ensemble. All are
+                     honest by construction, since model_train never saw
+                     D_meta, so no cross-fitting is needed for them.
   - fold models    : K-fold cross-fit over D_train u D_meta (§6's fix).
                      Used to compute honest out-of-fold Tier A (non-temperature)
                      and Tier C signals, plus correctness labels, for
@@ -21,11 +23,19 @@ project plan asks you to be honest about, not hide, §6/§7):
                      it produces every prediction and signal used at
                      evaluation time on D_cal and D_test.
 
-Tier B (ensemble disagreement) is optional (`use_ensemble=True`) and, when
-enabled, trains its own small ensemble on D_train u D_meta for both the
-meta-signal computation and deployment scoring -- cross-fitting an
-ensemble-of-ensembles is out of scope for this runner; see
-PROJECT_STATUS.md for the honest accounting of this simplification.
+Tier B (ensemble disagreement) is optional (`use_ensemble=True`). It is not
+cross-fitted -- an ensemble-of-ensembles over K folds x M members stays out
+of scope -- but its ensemble is trained on **D_train only**, which makes a
+single ensemble valid for scoring D_meta and D_cal/D_test alike, since both
+are disjoint from D_train. Tier B columns are therefore grafted onto every
+split in one fixed order, exactly like temperature and the calibration
+residual, so the meta and deployment feature spaces agree by construction.
+
+This replaced an earlier arrangement that trained the ensemble on
+D_train u D_meta and added Tier B only to the deployment path, leaving the
+aggregators trained on (A+C) columns but scored on (A+B+C) -- a mismatch
+that crashed on an assertion, so `use_ensemble=True` never ran. See
+PROJECT_STATUS.md for the honest accounting of what remains simplified.
 """
 from __future__ import annotations
 
@@ -53,7 +63,11 @@ from ..models.lightgbm_model import LightGBMWrapper
 from ..models.logreg_model import LogRegWrapper
 from ..signals.base import Signal, SignalBank
 from ..signals.ensemble import default_tier_b_bank
-from ..signals.tier_a import TemperatureScaledMSPSignal, default_tier_a_bank
+from ..signals.tier_a import (
+    CalibrationResidualSignal,
+    TemperatureScaledMSPSignal,
+    default_tier_a_bank,
+)
 from ..signals.tier_c import default_tier_c_bank
 from .seeding import set_seed
 
@@ -63,10 +77,30 @@ REPORT_COVERAGES = (1.0, 0.95, 0.90, 0.80, 0.70, 0.50)
 CONFORMAL_ALPHAS = (0.01, 0.02, 0.05, 0.10)
 
 
-def _build_signal_bank(tiers: tuple[str, ...], ensemble: Optional[list] = None) -> SignalBank:
+# Signals that must be fit on a split the base model was NOT trained on,
+# and so are excluded from the cross-fitting bank and grafted on separately
+# by `run_experiment` (fit on D_meta using `model_train`). Both would learn
+# the model's in-sample overconfidence if fit inside a training fold.
+HELD_OUT_FIT_SIGNALS = (TemperatureScaledMSPSignal, CalibrationResidualSignal)
+
+
+def _build_signal_bank(
+    tiers: tuple[str, ...], n_classes: int = 2, ensemble: Optional[list] = None
+) -> SignalBank:
+    """Build the cross-fittable part of the signal bank.
+
+    Excludes `HELD_OUT_FIT_SIGNALS`, which the runner grafts on after
+    fitting them on D_meta. `n_classes` is forwarded to
+    `default_tier_a_bank`, which drops `logitnorm_msp` on binary tasks
+    (it is provably constant there -- see its docstring).
+    """
     signals: list[Signal] = []
     if "A" in tiers:
-        signals += [s for s in default_tier_a_bank() if not isinstance(s, TemperatureScaledMSPSignal)]
+        signals += [
+            sig
+            for sig in default_tier_a_bank(n_classes=n_classes)
+            if not isinstance(sig, HELD_OUT_FIT_SIGNALS)
+        ]
     if "C" in tiers:
         signals += default_tier_c_bank()
     if "B" in tiers:
@@ -109,16 +143,67 @@ def run_experiment(
     pool_idx = np.concatenate([sp.train_idx, sp.meta_idx])
     y_pool = ds.y[pool_idx]
 
-    # --- model_train: D_train only, used solely to fit temperature on D_meta
-    model_train = _fit_model(model_name, X_train, y_train, seed=seed)
-    temp_signal = TemperatureScaledMSPSignal().fit(X_meta, y_meta, model_train)
+    n_classes = int(len(ds.classes))
 
-    # --- honest cross-fitted Tier A(-temp)/C signals + correctness labels
-    # over the D_train u D_meta pool (§6's fix for the leakage trap).
+    # --- model_train: D_train only. Used to fit every signal that needs a
+    # split the base model has not seen (temperature scaling, isotonic
+    # calibration residual) and, when Tier B is enabled, to train the
+    # disagreement ensemble -- see `held_out_signals` / `ensemble_train`.
+    model_train = _fit_model(model_name, X_train, y_train, seed=seed)
+    held_out_signals = [
+        TemperatureScaledMSPSignal().fit(X_meta, y_meta, model_train),
+        CalibrationResidualSignal().fit(X_meta, y_meta, model_train),
+    ]
+    held_out_names = [sig.name for sig in held_out_signals]
+
+    # --- Tier B (ensemble disagreement), if enabled.
+    #
+    # Previously this trained on D_train u D_meta and was used only for the
+    # deployment/test path, while the cross-fitted meta path silently
+    # excluded Tier B. That left the aggregators trained on an (A+C) column
+    # set but scored on an (A+B+C) one -- a column-count mismatch that the
+    # assertion below turned into a hard crash, so `use_ensemble=True` never
+    # ran at all.
+    #
+    # The fix keeps Tier B out of the cross-fitting loop (an
+    # ensemble-of-ensembles over K folds x M members remains out of scope)
+    # but trains it on **D_train only**, which makes one ensemble valid for
+    # scoring D_meta *and* D_cal/D_test: both are disjoint from D_train, so
+    # neither is scored in-sample. Tier B is then grafted on for every split
+    # exactly like the held-out-fit signals above, so the meta and
+    # deployment column sets agree by construction. The cost is that the
+    # ensemble sees 60% of the data rather than 75%; the benefit is that
+    # Tier B is honest, consistent across splits, and actually runs.
+    ensemble_train = None
+    tier_b_bank = None
+    tier_b_names: list[str] = []
+    if use_ensemble:
+        ensemble_train = _train_ensemble(
+            model_name, X_train, y_train, n_ensemble_members, seed
+        )
+        tier_b_bank = SignalBank(default_tier_b_bank(ensemble_train))
+        tier_b_bank.fit(X_train, y_train, model_train)
+        tier_b_names = list(tier_b_bank.names)
+
+    def _grafted(X, model) -> np.ndarray:
+        """Columns for the signals held out of the cross-fitting loop, in
+        the fixed order `held_out_names + tier_b_names`."""
+        cols = [sig.score(X, model).reshape(-1, 1) for sig in held_out_signals]
+        if tier_b_bank is not None:
+            cols.append(tier_b_bank.transform(X, model))
+        return np.hstack(cols)
+
+    grafted_names = held_out_names + tier_b_names
+
+    # --- honest cross-fitted Tier A(-held-out)/C signals + correctness
+    # labels over the D_train u D_meta pool (§6's fix for the leakage trap).
+    # Tier B is grafted on separately (see above), so it is excluded here.
+    cf_tiers = tuple(t for t in tiers if t != "B")
+
     def fit_model_fn(idx_abs: np.ndarray):
         Xi, yi = ds.X.iloc[idx_abs], ds.y[idx_abs]
         model = _fit_model(model_name, Xi, yi, seed=seed)
-        bank = _build_signal_bank(tuple(t for t in tiers if t != "B"))
+        bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
         bank.fit(Xi, yi, model)
         return {"model": model, "bank": bank}
 
@@ -136,10 +221,10 @@ def run_experiment(
     is_meta = np.isin(pool_idx, sp.meta_idx)
     U_meta_cf, correct_meta_cf = U_pool[is_meta], correct_pool[is_meta]
 
-    signal_names = _build_signal_bank(tuple(t for t in tiers if t != "B")).names
+    signal_names = _build_signal_bank(cf_tiers, n_classes=n_classes).names
 
     # --- naive (leaky) meta signals, for the naive-vs-cross-fit ablation
-    naive_bank = _build_signal_bank(tuple(t for t in tiers if t != "B"))
+    naive_bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
     naive_bank.fit(X_train, y_train, model_train)
     U_meta_naive = naive_bank.transform(X_meta, model_train)
     pred_naive = model_train.predict_proba(X_meta).argmax(axis=1)
@@ -149,22 +234,19 @@ def run_experiment(
     X_pool, y_pool_full = ds.X.iloc[pool_idx], y_pool
     model_final = _fit_model(model_name, X_pool, y_pool_full, seed=seed)
 
-    ensemble_final = None
-    if use_ensemble:
-        ensemble_final = _train_ensemble(model_name, X_pool, y_pool_full, n_ensemble_members, seed)
-
-    final_bank = _build_signal_bank(tiers, ensemble=ensemble_final)
-    # Non-temperature parts of the bank are fit on the full pool (their own
-    # geometry-index / no-op fits, as documented in tier_a.py/tier_c.py);
-    # temperature is grafted in from `temp_signal` (fit honestly on D_meta
-    # by model_train above -- see module docstring).
+    final_bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
+    # The cross-fittable part of the bank is fit on the full pool (their own
+    # geometry-index / no-op fits, as documented in tier_a.py/tier_c.py).
+    # Everything in `grafted_names` -- temperature, calibration residual and
+    # Tier B -- was fit on a split model_final's training pool does contain,
+    # so those are grafted in from objects built off `model_train`/
+    # `ensemble_train` above rather than refit here (see module docstring).
     final_bank.fit(X_pool, y_pool_full, model_final)
-    final_signal_names = final_bank.names + ["temp_msp"]
+    final_signal_names = list(final_bank.names) + grafted_names
 
     def score_final(X) -> np.ndarray:
         u = final_bank.transform(X, model_final)
-        t = temp_signal.score(X, model_final).reshape(-1, 1)
-        return np.hstack([u, t])
+        return np.hstack([u, _grafted(X, model_final)])
 
     U_cal = score_final(X_cal)
     U_test = score_final(X_test)
@@ -173,15 +255,24 @@ def run_experiment(
     incorrect_cal = (pred_cal != y_cal).astype(int)
     incorrect_test = (pred_test != y_test).astype(int)
 
-    # Align meta-signal columns with final-signal columns (final adds
-    # temperature at the end; cross-fit meta path didn't compute it, so we
-    # append it here using model_train -- honest, since model_train never
-    # saw D_meta).
-    U_meta_cf_full = np.hstack([U_meta_cf, temp_signal.score(X_meta, model_train).reshape(-1, 1)])
-    U_meta_naive_full = np.hstack(
-        [U_meta_naive, temp_signal.score(X_meta, model_train).reshape(-1, 1)]
+    # Align meta-signal columns with final-signal columns. The cross-fit
+    # meta path computes only the cross-fittable signals, so the grafted
+    # ones (temperature, calibration residual, Tier B) are appended here in
+    # the same order `score_final` uses. They are scored with `model_train`,
+    # which never saw D_meta, so this stays honest.
+    grafted_meta = _grafted(X_meta, model_train)
+    U_meta_cf_full = np.hstack([U_meta_cf, grafted_meta])
+    U_meta_naive_full = np.hstack([U_meta_naive, grafted_meta])
+    # Column sets must agree exactly, or the aggregators train on one
+    # feature space and score in another. This assertion is what used to
+    # fire when `use_ensemble=True`: Tier B was present in the final bank
+    # but absent from the meta path.
+    assert final_signal_names == list(signal_names) + grafted_names, (
+        f"meta/final signal columns disagree:\n"
+        f"  final = {final_signal_names}\n"
+        f"  meta  = {list(signal_names) + grafted_names}"
     )
-    assert final_signal_names == signal_names + ["temp_msp"]
+    assert U_meta_cf_full.shape[1] == U_test.shape[1] == len(final_signal_names)
 
     aggregator_factories = {
         "A0_rank": lambda: RankAverageAggregator(),
@@ -202,6 +293,11 @@ def run_experiment(
         return dict(
             dataset=dataset_name,
             base_model=model_name,
+            # Which signal tiers produced this row. Part of the results key:
+            # without it an (A,B,C) run would silently overwrite the (A,C)
+            # rows for the same (dataset, model, seed), and §7's
+            # signal-family-only ablation could not hold both side by side.
+            tiers="".join(sorted(tiers)),
             method=method,
             seed=seed,
             coverage=cov,

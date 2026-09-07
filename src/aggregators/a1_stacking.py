@@ -9,19 +9,54 @@ from __future__ import annotations
 import numpy as np
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 
 class LogRegStackingAggregator:
+    """L2-regularised logistic regression on the signal vector.
+
+    **Bug fix (unstandardised features under L2 regularisation).** The
+    signal vector mixes wildly different scales: Tier-A signals are
+    probabilities in [0, 1], while Tier-C signals are raw distances that run
+    to 1e3 and beyond (and, before its clamp, `trust_score` could reach
+    1e12). L2 regularisation penalises the *coefficient* magnitudes, so to
+    exert equal influence on the decision a small-scale feature needs a
+    proportionally larger coefficient -- and is therefore penalised far more
+    heavily for the same effect. The optimiser's least-cost solution is to
+    shrink the coefficients on the informative probability signals towards
+    zero and lean on the large-scale distance signals, which is precisely
+    backwards: MSP is the strongest single signal in every dataset measured
+    here, and `knn_distance`/`mahalanobis` are among the weakest.
+
+    Standardising first makes the penalty scale-free, so regularisation
+    strength reflects how *useful* a signal is rather than what units it
+    happens to be reported in. The scaler is fit inside `fit` and reused in
+    `score`, so no D_test statistics ever reach it (§6).
+
+    Note that A2's torch aggregators already standardise their inputs
+    (`_Standardizer` in `a2_coverage_loss.py`); only this estimator was
+    missing it, which also made the A1-vs-A2 comparison unfair to A1.
+    """
+
     name = "A1_logreg"
 
     def __init__(self, C: float = 1.0, seed: int = 0):
         self.C = C
         self.seed = seed
-        self.model: LogisticRegression | None = None
+        self.model: Pipeline | None = None
 
     def fit(self, U_meta: np.ndarray, correct_meta: np.ndarray) -> "LogRegStackingAggregator":
         incorrect = 1 - correct_meta.astype(int)
-        self.model = LogisticRegression(C=self.C, max_iter=2000, random_state=self.seed)
+        self.model = Pipeline(
+            [
+                ("scale", StandardScaler()),
+                (
+                    "clf",
+                    LogisticRegression(C=self.C, max_iter=2000, random_state=self.seed),
+                ),
+            ]
+        )
         self.model.fit(U_meta, incorrect)
         return self
 

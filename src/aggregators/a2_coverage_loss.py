@@ -27,11 +27,19 @@ class _Standardizer:
         return (U - self.mean_) / self.std_
 
 
-def _make_mlp(m_in: int, hidden: int, out: int, depth: int = 2) -> nn.Sequential:
+def _make_mlp(
+    m_in: int, hidden: int, out: int, depth: int = 2, dropout: float = 0.0
+) -> nn.Sequential:
+    """Small MLP. `dropout` (applied after each hidden activation) is a
+    meta-overfitting guard: the aggregator trains on D_meta, which is only
+    15% of the dataset -- 150 rows on German Credit -- while carrying far
+    more capacity than that supports."""
     layers: list[nn.Module] = []
     d = m_in
     for _ in range(depth - 1):
         layers += [nn.Linear(d, hidden), nn.ReLU()]
+        if dropout > 0:
+            layers += [nn.Dropout(dropout)]
         d = hidden
     layers += [nn.Linear(d, out)]
     return nn.Sequential(*layers)
@@ -49,9 +57,12 @@ class _BaseTorchAggregator:
         target_coverage: float = 0.8,
         hidden: int = 32,
         depth: int = 2,
-        epochs: int = 300,
+        epochs: int = 500,
         lr: float = 1e-2,
+        lr_min: float = 1e-5,
         weight_decay: float = 1e-4,
+        dropout: float = 0.1,
+        grad_clip: float = 1.0,
         seed: int = 0,
     ):
         assert loss in ("bce", "loss1", "loss2", "loss3")
@@ -61,12 +72,16 @@ class _BaseTorchAggregator:
         self.depth = depth
         self.epochs = epochs
         self.lr = lr
+        self.lr_min = lr_min
         self.weight_decay = weight_decay
+        self.dropout = dropout
+        self.grad_clip = grad_clip
         self.seed = seed
         self.scaler = _Standardizer()
         self.net: nn.Module | None = None
         self.tau: nn.Parameter | None = None  # loss1: scalar
         self.taus: nn.Parameter | None = None  # loss2: vector over KAPPA_GRID
+        self.bias: nn.Parameter | None = None  # adaptive-gating output bias
 
     def _build_net(self, m_in: int) -> nn.Module:
         raise NotImplementedError
@@ -76,6 +91,11 @@ class _BaseTorchAggregator:
         subclass, the standardized input it was computed from) to a scalar
         risk logit per row."""
         raise NotImplementedError
+
+    def _extra_params(self, base_error_rate: float) -> list[nn.Parameter]:
+        """Parameters a subclass owns outside `self.net`, given the observed
+        fraction of incorrect predictions on the meta set. Default: none."""
+        return []
 
     def fit(self, U_meta: np.ndarray, correct_meta: np.ndarray) -> "_BaseTorchAggregator":
         torch.manual_seed(self.seed)
@@ -87,6 +107,9 @@ class _BaseTorchAggregator:
 
         self.net = self._build_net(Un.shape[1])
         params = list(self.net.parameters())
+        # Subclass-owned extra parameters, initialised from the meta-set
+        # base error rate (see AdaptiveGatingAggregator._extra_params).
+        params += self._extra_params(float(incorrect.mean()))
 
         if self.loss_name == "loss1":
             self.tau = nn.Parameter(torch.zeros(()))
@@ -96,34 +119,59 @@ class _BaseTorchAggregator:
             params.append(self.taus)
 
         opt = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
+        # Cosine annealing from `lr` down to `lr_min`. Training was
+        # previously a fixed lr=1e-2 for 300 full-batch steps with no
+        # schedule and no stopping rule, which is large enough to keep
+        # bouncing around a minimum rather than settling into one.
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.epochs, eta_min=self.lr_min
+        )
 
+        self.net.train()
         for _ in range(self.epochs):
             opt.zero_grad()
             net_out = self.net(U_t)
             logit = self._score_logit(net_out, U_t)
-            s = torch.sigmoid(logit)
 
             if self.loss_name == "bce":
                 loss = bce_loss(logit, incorrect)
             elif self.loss_name == "loss1":
+                # Losses 1/2 are defined on the bounded score s in [0, 1]
+                # (the gate compares s against a threshold in the same
+                # units), so they take sigmoid(logit).
                 loss = soft_selective_risk_loss(
-                    s, incorrect, torch.sigmoid(self.tau), kappa=self.target_coverage
+                    torch.sigmoid(logit),
+                    incorrect,
+                    torch.sigmoid(self.tau),
+                    kappa=self.target_coverage,
                 )
             elif self.loss_name == "loss2":
                 loss = aurc_surrogate_loss(
-                    s, incorrect, torch.sigmoid(self.taus), kappa_grid=self.KAPPA_GRID
+                    torch.sigmoid(logit),
+                    incorrect,
+                    torch.sigmoid(self.taus),
+                    kappa_grid=self.KAPPA_GRID,
                 )
             else:  # loss3
-                loss = pairwise_ranking_loss(s, incorrect, generator=gen)
+                # Loss 3 is a *ranking* loss and takes the raw logit, so its
+                # margins are unbounded -- see `pairwise_ranking_loss`.
+                loss = pairwise_ranking_loss(logit, incorrect, generator=gen)
 
             loss.backward()
+            # Loss 1 divides by `sum(g)`, which can get small when the gate
+            # closes, so its gradient occasionally spikes; clip before the
+            # step rather than letting one batch throw the weights.
+            torch.nn.utils.clip_grad_norm_(params, max_norm=self.grad_clip)
             opt.step()
+            sched.step()
 
+        self.net.eval()
         return self
 
     def score(self, U: np.ndarray) -> np.ndarray:
         Un = self.scaler.transform(U)
         U_t = torch.tensor(Un, dtype=torch.float32)
+        self.net.eval()  # dropout must be off at scoring time
         with torch.no_grad():
             logit = self._score_logit(self.net(U_t), U_t)
             s = torch.sigmoid(logit)
@@ -139,7 +187,7 @@ class MLPAggregator(_BaseTorchAggregator):
         self.name = f"A2_mlp_{self.loss_name}"
 
     def _build_net(self, m_in: int) -> nn.Module:
-        return _make_mlp(m_in, self.hidden, out=1, depth=self.depth)
+        return _make_mlp(m_in, self.hidden, out=1, depth=self.depth, dropout=self.dropout)
 
     def _score_logit(self, net_out: torch.Tensor, U_t: torch.Tensor) -> torch.Tensor:
         return net_out.squeeze(-1)
@@ -158,13 +206,36 @@ class AdaptiveGatingAggregator(_BaseTorchAggregator):
         self.name = f"A2_adaptive_{self.loss_name}"
 
     def _build_net(self, m_in: int) -> nn.Module:
-        return _make_mlp(m_in, self.hidden, out=m_in, depth=self.depth)
+        return _make_mlp(m_in, self.hidden, out=m_in, depth=self.depth, dropout=self.dropout)
+
+    def _extra_params(self, base_error_rate: float) -> list[nn.Parameter]:
+        """Create the output bias.
+
+        **Bug fix (the gated score could not express a base rate).** The
+        score was `logit(x) = w(x)^T z(x)` with no intercept. `w` is a
+        softmax, so it sums to 1, and `z` is the z-scored signal vector, so
+        it has zero mean per column -- which pins the *average* logit at
+        approximately 0, i.e. a predicted error probability of
+        `sigmoid(0) = 0.5`. When the base model is right 90% of the time the
+        correct average logit is `log(0.1/0.9) ~= -2.2`, and the
+        architecture simply had no parameter capable of representing that.
+        The convex-combination constraint also caps the logit's range at
+        `max_j z_j(x)`, so it could not be compensated for by scaling.
+
+        Initialising the bias at the meta-set log-odds starts training at
+        the right base rate, leaving the network to learn only the
+        *deviation* from it -- which is all a gating network should be doing.
+        """
+        r = float(np.clip(base_error_rate, 1e-4, 1 - 1e-4))
+        self.bias = nn.Parameter(torch.tensor(np.log(r / (1.0 - r)), dtype=torch.float32))
+        return [self.bias]
 
     def _score_logit(self, net_out: torch.Tensor, U_t: torch.Tensor) -> torch.Tensor:
         # net_out: (n, m) gating logits over the m standardized signals in
-        # U_t; s(x) = sum_j w_j(x) * z_j(x), per §3.4.
+        # U_t; s(x) = sum_j w_j(x) * z_j(x) + bias, per §3.4 (the bias is
+        # the fix described in `_extra_params`).
         w = torch.softmax(net_out, dim=1)
-        return (w * U_t).sum(dim=1)
+        return (w * U_t).sum(dim=1) + self.bias
 
     def weights(self, U: np.ndarray) -> np.ndarray:
         """Learned per-signal gating weights w(x) for interpretability

@@ -64,9 +64,19 @@ def main(cfg: DictConfig) -> None:
     RESULTS_PATH.parent.mkdir(exist_ok=True)
     if RESULTS_PATH.exists():
         existing = pd.read_parquet(RESULTS_PATH)
-        # Replace any prior rows for this exact (dataset, model, seed) combo
-        # so re-running a config is idempotent instead of duplicating rows.
-        key_cols = ["dataset", "base_model", "seed"]
+        # Replace any prior rows for this exact
+        # (dataset, model, tiers, seed) combo so re-running a config is
+        # idempotent instead of duplicating rows. `tiers` is part of the key
+        # because an (A,B,C) run and an (A,C) run are different experiments
+        # that must coexist in the file, not overwrite each other.
+        key_cols = ["dataset", "base_model", "tiers", "seed"]
+        for col in key_cols:
+            if col not in existing.columns:
+                raise SystemExit(
+                    f"results.parquet predates the '{col}' results column and "
+                    f"cannot be merged safely. Move it aside (or delete it) "
+                    f"and re-run; every number is reproducible from the CLI."
+                )
         mask = existing.set_index(key_cols).index.isin(
             new_results.set_index(key_cols).index
         )
