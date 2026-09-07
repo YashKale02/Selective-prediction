@@ -1,5 +1,14 @@
 # Project Summary: Risk-Aware Multi-Criteria Selective Prediction
 
+> [!WARNING]
+> Written before the bug-fix pass in commit `bf964fc`. Seven
+> signal/aggregator defects were found afterwards (two signals outright
+> broken, Tier B never executing, the A2 aggregators unable to train), so
+> any results, scores or rankings quoted here are not trustworthy. See the
+> top of [`betterment.md`](betterment.md) and "Bugs found and fixed" in
+> [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+
+
 > **In a Nutshell:**  
 > Standard AI models often guess blindly when they are unsure, which can cause catastrophic mistakes in critical domains like medicine, finance, or law.  
 > **Selective Prediction** teaches an AI to **"know what it doesn't know"** and say *"I don't know — let a human handle this"* whenever it is at high risk of making an error.  

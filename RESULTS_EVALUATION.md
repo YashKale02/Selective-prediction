@@ -1,5 +1,34 @@
 # Experimental Results Evaluation & Critical Assessment
 
+> [!WARNING]
+> **These numbers predate the bug-fix pass in commit `bf964fc` and should
+> not be quoted.** Seven signal/aggregator defects were found afterwards,
+> four of which were degrading every aggregator result on this page. Most
+> relevant to the tables below:
+>
+> * **`signal_energy` was broken**, not merely weak. On the binary logit
+>   gauge it computed a rank-equivalent copy of `P(class 0)` rather than
+>   uncertainty, so a confident prediction of one class was ranked *more*
+>   uncertain than the decision boundary. Its poor score here reflects a
+>   sign/gauge bug, not a property of energy-based uncertainty.
+> * **`signal_logitnorm_msp` returned a constant**, so its ranking was
+>   arbitrary — and it was fed as a feature into every aggregator.
+> * **Tier B (ensemble disagreement) had never executed at all**;
+>   `use_ensemble=True` crashed on an assertion, so any "full signal bank"
+>   framing here is really Tier A+C only.
+> * **The A2 neural aggregators could not train properly** (bounded
+>   ranking-loss margins, a saturating gate, a coverage penalty that never
+>   bound, and a missing intercept in the gating variant). Their weak
+>   showing is not evidence about coverage-targeted losses.
+>
+> Also note the deeper structural finding, which no bug fix changes: on a
+> binary task **every Tier-A signal is a strictly monotone transform of
+> every other one** (pairwise Spearman |ρ| = 1.0000), so the rows above
+> that tie `signal_msp` at identical AURC are tying by construction, not
+> coincidence. See the top of [`betterment.md`](betterment.md) and
+> "Bugs found and fixed" in [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+
+
 > **Project:** Risk-Aware Multi-Criteria Selective Prediction  
 > **Evaluation Date:** September 2026  
 > **Evaluated Datasets:** Adult (Census Income), German Credit, Electricity (Temporal Shift)  

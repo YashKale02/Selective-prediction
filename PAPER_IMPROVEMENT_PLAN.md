@@ -1,5 +1,14 @@
 # Action Plan: Transforming the Codebase into a High-Impact IEEE Paper
 
+> [!WARNING]
+> Written before the bug-fix pass in commit `bf964fc`. Seven
+> signal/aggregator defects were found afterwards (two signals outright
+> broken, Tier B never executing, the A2 aggregators unable to train), so
+> any results, scores or rankings quoted here are not trustworthy. See the
+> top of [`betterment.md`](betterment.md) and "Bugs found and fixed" in
+> [`PROJECT_STATUS.md`](PROJECT_STATUS.md).
+
+
 > **Target Venue:** IEEE Conference (e.g., IEEE BigData, ICMLA, or IEEE TNNLS / CVPR-W)  
 > **Current Status:** Complete working pipeline, 3 real datasets evaluated, verified citations, working test suite.  
 > **Goal:** Step-by-step roadmap to elevate the paper from a scaffolded project into a compelling, rigorous, and highly citable publication.
