@@ -11,6 +11,21 @@ downstream signal can assume a (n, K) logits shape uniformly.
 input space as the representation for Tier-C distance-based signals. This
 is a standard, documented approximation for GBM base models (see §3.1,
 Tier C docstring) — not a hidden shortcut.
+
+**Bug fix (seed variance):** LightGBM's own defaults are
+`bagging_fraction=1.0`/`feature_fraction=1.0`, i.e. no row/column
+subsampling. With those defaults, `random_state` has no source of
+randomness left to act on -- on a dataset with a deterministic split
+(`is_temporal=True`, e.g. Electricity), every seed then trains a
+bit-for-bit identical model, so "10 seeds" only exercises randomness
+downstream (cross-fitting folds, aggregator init), not the base model
+itself. This was caught by inspecting the Electricity 10-seed run, where
+every `signal_msp` AURC was identical to machine precision across seeds.
+Fixed by defaulting to `bagging_fraction=0.8`, `bagging_freq=1`,
+`feature_fraction=0.8` below, so `random_state` actually varies the
+trained model; still overridable via `**lgb_kwargs` (and hence via Hydra's
+`model.*` config group) for anyone who wants to turn subsampling back off
+deliberately.
 """
 from __future__ import annotations
 
@@ -23,10 +38,22 @@ from .preprocessing import build_preprocessor
 
 
 class LightGBMWrapper(BaseModelWrapper):
+    # Defaults chosen so `random_state` actually produces a different
+    # trained model per seed (see the module docstring's "Bug fix" note) --
+    # LightGBM's own defaults (bagging_fraction=feature_fraction=1.0) leave
+    # random_state with nothing to act on. Any caller can override these
+    # via lgb_kwargs (e.g. from a Hydra `model.*` config) to turn
+    # subsampling back off deliberately.
+    _RANDOMNESS_DEFAULTS = dict(
+        bagging_fraction=0.8,
+        bagging_freq=1,
+        feature_fraction=0.8,
+    )
+
     def __init__(self, seed: int = 0, n_estimators: int = 300, **lgb_kwargs):
         self.seed = seed
         self.n_estimators = n_estimators
-        self.lgb_kwargs = lgb_kwargs
+        self.lgb_kwargs = {**self._RANDOMNESS_DEFAULTS, **lgb_kwargs}
         self.preprocessor = None
         self.model: LGBMClassifier | None = None
         self.n_classes_: int = 0

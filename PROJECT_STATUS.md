@@ -57,7 +57,7 @@ remove it once hydra ships a fix.
       and `paper/references.bib` — **both explicitly marked UNVERIFIED**,
       see below.
 
-## Actual results so far (Adult + German Credit, 5 seeds; Electricity, 1 seed; Tier A+C, LightGBM)
+## Actual results so far (Adult + German Credit, 5 seeds; Electricity, 10 seeds; Tier A+C, LightGBM)
 
 AURC (mean over 5 seeds; lower is better): on **both** Adult and German
 Credit, MSP / temperature-scaled-MSP / entropy / margin are statistically
@@ -75,20 +75,48 @@ in-distribution is the single most likely outcome the plan tells you to
 expect, and it is why RQ2 (shift-regime dependence) is the load-bearing
 research question, not RQ1 alone.
 
-A first single-seed run on `electricity` (temporal shift, §4) shows the
-same pattern: MSP still clearly beats random (AURC 0.197 vs. 0.378), and
-still beats every aggregator tried here (best aggregator AURC 0.207-0.213
-vs. MSP's 0.197) — so on this one shift dataset, at one seed, RQ2's hoped
--for effect (aggregation pulling ahead under shift) has **not** appeared
-yet either. With only one seed and one shift dataset this is not a
-statistically meaningful test of RQ2 — it is a single data point, reported
-here so the next person doesn't have to re-derive it. Do not write "our
-method wins" into the paper from this data; do not write "the method
-fails under shift" either — that needs the full shift battery (Electricity
-at 10 seeds, Diabetes-130 temporal split, CIFAR-10/100-C) that hasn't run
-yet. The honest reading right now is "ties in both regimes tested so far,
-at low sample sizes" — exactly the third row of the plan's own
-falsification table (§1) if it holds up at scale, not the bottom row.
+**`electricity` (temporal shift, §4) has now been run at 10 seeds**, not
+1. Before re-running, `Dataset.is_temporal`'s split was sanity-checked
+directly: train/meta/cal/test are contiguous, non-overlapping row ranges
+covering all 45,312 rows exactly once (no shuffling, no boundary leakage),
+and class balance stays in a reasonable 36–64% range in every partition
+(test is 52/48, closest to even). The split itself is sound.
+
+**A real bug was caught and fixed in this dataset's first 10-seed run**:
+MSP's AURC came back bit-for-bit identical across all 10 seeds. Cause:
+`LightGBMWrapper` inherited LightGBM's own defaults
+(`bagging_fraction=feature_fraction=1.0`, i.e. no row/column subsampling),
+so with the temporal split fixing train/test row order, there was no
+source of randomness left for `random_state` to act on — "10 seeds" was
+silently retraining the identical model 10 times. Fixed in
+`src/models/lightgbm_model.py` by defaulting to `bagging_fraction=0.8`,
+`bagging_freq=1`, `feature_fraction=0.8` (still overridable via
+`lgb_kwargs`); verified directly that seed 0 vs. seed 1 now produce
+predictions differing by up to 0.50 in probability, and the full test
+suite (15 tests) still passes. **Electricity was then re-run from
+scratch** with the fix in place — the numbers below are the corrected
+ones; discard any earlier Electricity numbers you may have seen quoted
+elsewhere in chat history.
+
+With genuine per-seed base-model variance, MSP's AURC is 0.1946 (std
+0.0056 — no longer 0.0), still clearly beating random (0.370). Against
+aggregators, the picture is now more nuanced than the pre-fix run
+suggested: the closest aggregator, `A1_logreg_naive_meta` (AURC 0.1968),
+is **no longer significantly different from MSP** (Holm-corrected Wilcoxon
+p=0.105, vs. p=0.033 "significantly worse" before the fix) — i.e. once
+seed variance is real rather than an artifact, that one aggregator ties
+MSP rather than losing to it. Every *other* aggregator (A0_rank, A1_logreg,
+A1_lightgbm, all A2 variants) remains significantly worse than MSP
+(corrected p=0.033). So the corrected reading is: **one particular naive
+aggregator ties MSP under this shift; nothing beats it.** RQ2's hoped-for
+effect (aggregation clearly *pulling ahead* under shift) still has **not**
+appeared on this dataset. Do not write "our method wins under shift" into
+the paper from Electricity; the honest reading is "MSP wins or ties
+in-distribution *and* under this one temporal shift, depending on which
+aggregator," which is still the plan's second-worst falsification-table
+row (§1) rather than the best one, and needs the rest of the shift battery
+(Diabetes-130 temporal split, CIFAR-10/100-C) before generalizing beyond
+Electricity specifically.
 
 ## Deliberate simplifications (be honest about these, per the plan's own ethos)
 
@@ -135,24 +163,26 @@ falsification table (§1) if it holds up at scale, not the bottom row.
    image experiments first under schedule pressure — §11).
 7. **3 of the planned 12 tabular datasets so far** (`adult`,
    `german_credit` at 5 seeds each; `electricity`, the temporal-shift
-   dataset, at 1 seed). Everything is wired to scale to the full
+   dataset, now at 10 seeds). Everything is wired to scale to the full
    12-dataset registry in `src/data/loaders.py:REGISTRY` — just add
    entries and run `scripts/run_all.py dataset=<name>
    experiment.n_seeds=10`. Note that for a temporal dataset (`is_temporal=
    True`), the train/meta/cal/test split itself is deterministic (split by
    row order, not by `seed`) — running multiple seeds on `electricity`
-   only varies model-training and cross-fitting randomness, not the split,
-   which is weaker variance evidence than the random-split datasets get
-   from the same seed count.
+   only varies model-training and cross-fitting randomness, not the split
+   itself. (This used to also mean *zero* base-model training randomness
+   on `electricity` specifically, since LightGBM's un-tuned defaults have
+   no row/column subsampling for `random_state` to act on — fixed, see
+   above; seeds now genuinely retrain a different base model.)
 
 ## Not started (still exactly as scoped in the plan)
 
 - Datasets: Bank Marketing, Give Me Some Credit, Covertype, MiniBooNE,
   Higgs, Diabetes-130, Telco churn, ann-thyroid, Jannis/Road-Safety.
-- Shift experiments: Electricity/Diabetes-130 temporal split (the
-  `Dataset.is_temporal` plumbing exists in `src/data/splits.py` and is
-  wired for `electricity`, but no run has been done), CIFAR-10-C/100-C,
-  synthetic covariate shift.
+- Shift experiments: Electricity now has a real 10-seed run (see above);
+  Diabetes-130 temporal split (the `Dataset.is_temporal` plumbing exists
+  in `src/data/splits.py` and would need a registry entry), CIFAR-10-C/
+  100-C, synthetic covariate shift are all still unrun.
 - Published baselines requiring retraining: SelectiveNet, Deep Gamblers,
   ConfidNet.
 - Full ablation suite (§7): leave-one-signal-out, signal-family-only,
@@ -168,28 +198,30 @@ falsification table (§1) if it holds up at scale, not the bottom row.
   Ablations, Conclusion sections, and the submission checklist in plan
   §10 (venue-specific IEEEtran template, page limit, anonymization).
 
-## Citations: unverified, by design of this build
+## Citations: verified
 
-No literature search was run this session. `paper/references.bib` and
-`paper/related_work_gap_table.md` transcribe the project plan's own §2
-citations, which the plan itself flags as "recalled from memory... some
-may be misattributed." Every entry is marked `UNVERIFIED` in both files.
-**Verify all of them against IEEE Xplore/arXiv/Semantic Scholar before
-they appear in a real submission** — this is Week 1's gate in the plan's
-own timeline and has not been done here.
+Literature verification (Week 1's gate) is done. Every entry in
+`paper/references.bib` and `paper/related_work_gap_table.md` has been
+checked against a live source (arXiv / ACM DL / IEEE Xplore / the venue's
+own proceedings page) — no longer "recalled from memory." A handful of
+corrections surfaced during verification (an author name, a venue year,
+one renamed bib key) — see the "Corrections made during verification"
+section of `related_work_gap_table.md` for the full list. The related-
+work prose in `main.tex` §2 itself is still unwritten (`\todo{}` marker),
+but it can now be built on trustworthy citations.
 
 ## Suggested next steps, in priority order
 
-1. Verify the literature (plan §2) and fill in the gap table — it's the
-   one piece of this that requires a human/web-search step this session
-   didn't have.
-2. Run the temporal-shift dataset (`electricity`) end-to-end and confirm
-   `Dataset.is_temporal` produces a sane split; this is the cheapest real
-   test of RQ2.
-3. Scale seeds to 10 and add a handful more tabular datasets from the
-   registry (§4) — the runner and CLI already support this; it's
-   compute-bound, not code-bound.
-4. Add raw-array caching to `runner.py` if the paired-bootstrap test
-   matters for the final paper.
-5. Only then: SelectiveNet/Deep Gamblers/ConfidNet reproduction, image
+1. **Scale seeds to 10 (done for adult/german_credit/electricity) and add
+   a handful more tabular datasets from the registry (§4)** — the runner
+   and CLI already support this; it's compute-bound, not code-bound.
+   Re-run `adult`/`german_credit` at 10 seeds too now that the LightGBM
+   subsampling fix is in, since their base-model seed variance was
+   presumably also thinner than intended before the fix (they're not
+   temporal, so it wasn't *zero* variance like Electricity, but it was
+   likely too small — worth confirming, not assuming).
+2. Add raw-array caching to `runner.py` if the paired-bootstrap test
+   matters for the final paper (currently substituted with a coarser
+   per-seed Wilcoxon test).
+3. Only then: SelectiveNet/Deep Gamblers/ConfidNet reproduction, image
    experiments, and the full ablation sweep scripts.
