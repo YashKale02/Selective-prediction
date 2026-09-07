@@ -105,7 +105,16 @@ def pairwise_wilcoxon_vs_baseline(
                     "significant_at_0.05": p_adj < 0.05,
                 }
             )
-    return pd.DataFrame(results)
+    cols = [
+        "dataset",
+        "baseline",
+        "method",
+        "mean_aurc_delta",
+        "p_value",
+        "p_value_holm",
+        "significant_at_0.05",
+    ]
+    return pd.DataFrame(results, columns=cols)
 
 
 def friedman_and_nemenyi(df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
@@ -190,7 +199,10 @@ def main():
     wilcoxon_tbl = pairwise_wilcoxon_vs_baseline(df, baseline="signal_msp")
     wilcoxon_tbl.to_csv(TABLE_DIR / "wilcoxon_vs_msp.csv", index=False)
     print("\n=== Wilcoxon signed-rank vs. MSP baseline (Holm-corrected) ===")
-    print(wilcoxon_tbl.sort_values(["dataset", "p_value_holm"]).to_string(index=False))
+    if wilcoxon_tbl.empty:
+        print("(No pairwise Wilcoxon tests possible with <2 seeds per dataset)")
+    else:
+        print(wilcoxon_tbl.sort_values(["dataset", "p_value_holm"]).to_string(index=False))
 
     cd_table, note = friedman_and_nemenyi(df)
     cd_table.to_csv(TABLE_DIR / "friedman_mean_ranks.csv", index=False)
