@@ -1,8 +1,8 @@
 # Fix Critical Bugs & Improve Models for IEEE-Worthy Results
 
 > [!NOTE]
-> **STATUS: IMPLEMENTED — but two claims in this document turned out to be
-> wrong, and one of the fixes below should not be applied as written.**
+> **STATUS: IMPLEMENTED — but three claims in this document turned out to
+> be wrong, and two of the fixes below must not be applied as written.**
 > Read this box before using anything further down as a spec. Full
 > write-up, with the measurements behind each point, is in the
 > "Bugs found and fixed" section of
@@ -59,6 +59,43 @@ problems the only genuinely independent orderings come from **Tier B**
 (ensemble disagreement), **Tier C** (geometry/density) and the new
 `calib_residual` signal.
 
+### Correction 3 — Fixes 5 and 6 must not both be applied as written
+
+Fix 5 (gate temperature `T: 0.05 -> 0.5`) and Fix 6 (coverage penalty
+`lambda: 1.0 -> 10.0`) are each plausible in isolation and **catastrophic
+together**. Neither this document nor the first implementation pass checked
+whether the target coverage was still *reachable*:
+
+| gate applied to | max reachable `mean(g)` at T=0.5 | target kappa |
+|---|---|---|
+| squashed score `sigmoid(logit)` (as specified) | **0.7170** | 0.80 — unreachable |
+| raw logit (unbounded) | 0.9781 | 0.80 — fine |
+
+With `s` confined to [0, 1] and `tau` to (0, 1), a gate soft enough to have
+usable gradients cannot attain coverage 0.8 at all. `relu(kappa - mean(g))^2`
+is then permanently active, and at `lambda = 10` it dominates the
+selective-risk term. The optimiser's cheapest way to raise `mean(g)` is to
+collapse the score toward a constant — which destroys the ranking the loss
+is supposed to be learning. Measured on a full 10-seed run:
+
+* `A2_mlp_loss1` on Adult: AURC **0.0317 -> 0.1957**, against random's
+  0.1284, i.e. *worse than random abstention*
+* `A2_mlp_loss2` on Adult: AURC **0.0303 -> 0.2127**
+* the same collapse on German Credit and Electricity
+
+The root cause is the very "double-sigmoid saturation" this document
+correctly diagnosed under Fix 5 — but the prescription treated the symptom
+(widen `T`) instead of removing the second sigmoid. **The gate now operates
+on the raw logit**, with `tau` a free threshold in logit units: coverage
+becomes reachable, gradients stay healthy, and `lambda = 10` can bind
+legitimately rather than buying a degenerate solution.
+
+General lesson worth keeping: *strengthening a penalty on an unsatisfiable
+constraint does not enforce it, it just makes the degenerate escape route
+cheaper than the real objective.* Two regression tests now pin this — one
+asserts the gate can reach a high coverage, one asserts loss1/loss2 still
+produce a usable ranking (AUC > 0.8) rather than a collapsed constant.
+
 ### Also fixed, though not listed in this document
 
 * **Tier B had never run once.** `use_ensemble=True` crashed on an
@@ -110,7 +147,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### Signal Fixes (Tier A)
 
-#### [MODIFY] [tier_a.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/signals/tier_a.py)
+#### [MODIFY] [tier_a.py](src/signals/tier_a.py)
 
 **Fix 1: EnergySignal — broken on binary classification.**
 - Current: Binary logits are `[0, s]`, so `logsumexp([0, s]) = ln(1 + e^s)` — this is monotonic with class-1 probability, not uncertainty. Confident class-0 predictions get the *highest* uncertainty score.
@@ -124,7 +161,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### Aggregator Architecture Fixes
 
-#### [MODIFY] [a2_coverage_loss.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/aggregators/a2_coverage_loss.py)
+#### [MODIFY] [a2_coverage_loss.py](src/aggregators/a2_coverage_loss.py)
 
 **Fix 3: AdaptiveGatingAggregator — missing bias/intercept.**
 - Current: `logit(x) = w(x)^T z(x)` with no bias. Since `w` sums to 1 and `z` is zero-mean, the logit is trapped near 0 (σ(0) = 0.5). When the true error rate is 10%, the model mathematically cannot shift its baseline prediction to `log(0.1/0.9) ≈ -2.2`.
@@ -138,7 +175,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### Loss Function Fixes
 
-#### [MODIFY] [losses.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/aggregators/losses.py)
+#### [MODIFY] [losses.py](src/aggregators/losses.py)
 
 **Fix 5: Soft selective risk — vanishing gradients from T=0.05.**
 - Current: Gate `g = σ((τ - s) / 0.05)` creates a near-binary step function. Gradient `σ'(20·(τ-s))` drops to <0.018 when `|τ-s| > 0.2`. Combined with the outer sigmoid on `s`, this creates double-sigmoid saturation that kills learning.
@@ -152,7 +189,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### A1 Stacking Fixes
 
-#### [MODIFY] [a1_stacking.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/aggregators/a1_stacking.py)
+#### [MODIFY] [a1_stacking.py](src/aggregators/a1_stacking.py)
 
 **Fix 7: LogRegStacking — no feature scaling.**
 - Current: Raw `U_meta` (with Tier A signals in [0,1] and Tier C signals in [0, 1000+]) is fed directly into `LogisticRegression(C=1.0)`. L2 regularization penalizes all weights equally, so the optimizer learns tiny weights for informative small-scale signals (MSP, entropy) and large weights for noisy large-scale signals (Mahalanobis, kNN).
@@ -162,7 +199,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### A2 Training Improvements
 
-#### [MODIFY] [a2_coverage_loss.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/aggregators/a2_coverage_loss.py)
+#### [MODIFY] [a2_coverage_loss.py](src/aggregators/a2_coverage_loss.py)
 
 **Fix 8: Training regime — full-batch, no schedule, no early stopping, only 300 steps.**
 - Add **learning rate cosine annealing** (from `lr=1e-2` to `lr=1e-5` over training).
@@ -174,7 +211,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### Signal Robustness Improvements
 
-#### [MODIFY] [tier_c.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/signals/tier_c.py)
+#### [MODIFY] [tier_c.py](src/signals/tier_c.py)
 
 **Fix 9: TrustScore — extreme outliers destabilize training.**
 - Current: When `d_pred ≈ 0`, trust score can reach `-1e12`, ruining z-score normalization and gradient stability.
@@ -187,7 +224,7 @@ Deep codebase research uncovered **7 critical bugs** and **8 design flaws** that
 
 ### New Signal: Confidence Disagreement Score
 
-#### [MODIFY] [tier_a.py](file:///c:/Users/Admin/Desktop/Selective_predict/src/signals/tier_a.py)
+#### [MODIFY] [tier_a.py](src/signals/tier_a.py)
 
 **Addition: `ConfidenceDisagreementSignal` — a signal that IS NOT monotonically equivalent to MSP.**
 - All current Tier A signals (MSP, entropy, margin, temp_msp) are monotonic transforms of each other on binary tasks, providing zero additional ranking information.

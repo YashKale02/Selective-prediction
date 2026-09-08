@@ -68,7 +68,7 @@ Frame the paper as an **authoritative empirical reality check and benchmark** on
    python scripts/run_all.py dataset=electricity experiment.n_seeds=5
    ```
 2. **Add 3 More Tabular Datasets from the Registry:**
-   In [`src/data/loaders.py`](file:///c:/Users/Admin/Desktop/Selective_predict/src/data/loaders.py), register and run:
+   In [`src/data/loaders.py`](src/data/loaders.py), register and run:
    - `bank_marketing` (imbalanced tabular financial data)
    - `diabetes_130` (high-stakes medical prediction with hospital shift)
    - `covertype` or `churn` (multi-feature classification)
@@ -91,7 +91,7 @@ Reviewers need to see **why** adding 12 signals did not dramatically beat 1 sign
 
 ### Pillar 3: Strengthen the Conformal Guarantee Layer (RQ3)
 
-**Current state:** [`src/conformal/risk_control.py`](file:///c:/Users/Admin/Desktop/Selective_predict/src/conformal/risk_control.py) uses a standard Hoeffding bound with Bonferroni correction.  
+**Current state:** [`src/conformal/risk_control.py`](src/conformal/risk_control.py) uses a standard Hoeffding bound with Bonferroni correction.  
 **Issue:** Vanilla Hoeffding is variance-oblivious and loose, meaning for small target risks (e.g., $\alpha = 0.02$ or $0.05$), the conservative threshold results in $0\%$ coverage unless the calibration set is massive.
 
 - **Upgrade Options:**
@@ -105,7 +105,7 @@ Reviewers need to see **why** adding 12 signals did not dramatically beat 1 sign
 
 Selective classification often magnifies societal bias: a model may achieve an overall $5\%$ error rate by rejecting $90\%$ of minority applicants or concentrating all residual errors on them.
 
-- **Implementation:** The project already contains [`src/metrics/subgroup.py`](file:///c:/Users/Admin/Desktop/Selective_predict/src/metrics/subgroup.py) which computes:
+- **Implementation:** The project already contains [`src/metrics/subgroup.py`](src/metrics/subgroup.py) which computes:
   - `worst_group_risk`: Maximum error rate among demographic subgroups.
   - `max_min_risk_gap`: Disparity between best-served and worst-served groups.
   - `rejection_rate_by_group`: Disparity in abstention rates across groups.
@@ -116,7 +116,7 @@ Selective classification often magnifies societal bias: a model may achieve an o
 
 ---
 
-### Pillar 5: Complete the Paper Draft ([`paper/main.tex`](file:///c:/Users/Admin/Desktop/Selective_predict/paper/main.tex))
+### Pillar 5: Complete the Paper Draft ([`paper/main.tex`](paper/main.tex))
 
 Replace every remaining `\todo{}` marker with clean, authoritative text:
 
@@ -125,7 +125,7 @@ Replace every remaining `\todo{}` marker with clean, authoritative text:
 - State the concrete findings: MSP is near-optimal in-distribution; linear stacking excels under temporal shift; deep neural aggregators suffer from meta-overfitting; geometric signals fail on tabular features.
 
 #### 2. Related Work (Section II)
-- Convert [`paper/related_work_gap_table.md`](file:///c:/Users/Admin/Desktop/Selective_predict/paper/related_work_gap_table.md) into four structured narrative subsections:
+- Convert [`paper/related_work_gap_table.md`](paper/related_work_gap_table.md) into four structured narrative subsections:
   1. *Foundations of Selective Classification* (Chow 1970, Geifman & El-Yaniv 2017).
   2. *Learned Abstention vs. The Strong Baseline Phenomenon* (SelectiveNet, ConfidNet vs. Feng et al. 2023, Cattelan & Silva 2023).
   3. *Uncertainty & Out-of-Distribution Signals* (Lakshminarayanan 2017, Liu et al. 2020, Lee et al. 2018).

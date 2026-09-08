@@ -18,20 +18,36 @@ import torch
 import torch.nn.functional as F
 
 
-# Gate temperature for the soft accept/reject decision.
+# Gate temperature for the soft accept/reject decision, in **logit units**.
 #
-# **Bug fix (vanishing gradients from an over-sharp gate).** This was 0.05,
-# which makes `sigmoid((tau - s)/T)` a near-step function: its derivative
-# carries a factor 1/T = 20 at the threshold but decays as
-# `sigmoid'(20*(tau-s))`, falling below 0.018 once |tau - s| > 0.2. Since
-# the caller passes `s = sigmoid(logit)`, which is itself already
-# saturating, the two sigmoids compose into a double-saturation that leaves
-# almost every training point with no usable gradient -- only the handful of
-# rows sitting within ~0.2 of tau could learn anything, so the network
-# barely moved from its initialisation. T=0.5 keeps the gate smooth across
-# the whole [0, 1] range that `s` actually occupies; the coverage penalty
-# below is what drives the gate towards a decisive split at convergence, so
-# sharpness does not need to be baked into T.
+# **Bug fix, in two stages -- read both, because the obvious first fix is
+# actively harmful on its own.**
+#
+# Stage 1, the original defect: T was 0.05 and the gate was applied to the
+# squashed score `s = sigmoid(logit)`. That makes `sigmoid((tau - s)/T)` a
+# near-step function whose derivative decays as `sigmoid'(20*(tau - s))`,
+# below 0.018 once |tau - s| > 0.2. Composed with the already-saturating
+# sigmoid producing `s`, the two sigmoids form a double-saturation that
+# leaves almost every training row with no usable gradient.
+#
+# Stage 2, the trap: simply widening T on the *bounded* score makes things
+# far worse. With `s` confined to [0, 1] and `tau` to (0, 1), a soft gate
+# cannot reach a high coverage at all -- measured, the maximum achievable
+# `mean(g)` over all tau is only **0.7170 at T=0.5**, against a target
+# kappa of 0.80. The coverage penalty is then permanently unsatisfiable,
+# and (especially at the stronger lambda below) it dominates the loss. The
+# cheapest way for the optimiser to raise `mean(g)` is to collapse `s`
+# toward a constant, which destroys the ranking outright: this drove
+# `A2_mlp_loss1` on Adult from AURC 0.0317 to 0.1957, i.e. *worse than
+# random abstention* (0.1284), and `A2_mlp_loss2` from 0.0303 to 0.2127.
+#
+# The actual fix is to gate on the **raw logit**, which is unbounded, so
+# any coverage is reachable by moving tau (measured max `mean(g)` = 0.978
+# at T=0.5) while the gradient stays healthy across the range the logit
+# really occupies. This also removes the double-saturation at its source
+# rather than papering over it, since there is now only one sigmoid between
+# the network and the gate. `tau` is correspondingly a free parameter in
+# logit units, not a probability.
 DEFAULT_GATE_T = 0.5
 
 # Weight on the coverage constraint.
@@ -43,11 +59,18 @@ DEFAULT_GATE_T = 0.5
 # almost entirely and still report a good loss, which defeats the point of a
 # *coverage-targeted* objective (§3.3). At 10.0 the same 10-point miss costs
 # 0.1, i.e. comparable to the risk term, so the constraint actually binds.
+#
+# This is only safe because the gate above now operates on the unbounded
+# logit, which makes the target coverage *reachable*. Raising lambda while
+# the target was unreachable is what caused the collapse documented under
+# DEFAULT_GATE_T -- a strong penalty on an unsatisfiable constraint buys a
+# degenerate solution, not a better one. Do not raise lambda without first
+# confirming that `mean(g) = kappa` is attainable.
 DEFAULT_COVERAGE_LAMBDA = 10.0
 
 
 def soft_selective_risk_loss(
-    s: torch.Tensor,
+    s_logit: torch.Tensor,
     incorrect: torch.Tensor,
     tau: torch.Tensor,
     kappa: float,
@@ -56,11 +79,16 @@ def soft_selective_risk_loss(
 ) -> torch.Tensor:
     """Loss 1 (§3.3): soft selective risk at target coverage kappa.
 
-    g(x) = sigmoid((tau - s(x)) / T)   -- soft "accept" gate (accept when
-                                           s(x) is comfortably below tau)
+    g(x) = sigmoid((tau - z(x)) / T)   -- soft "accept" gate (accept when
+                                           the risk logit z(x) is
+                                           comfortably below tau)
     L = sum g*err / sum g  +  lam * relu(kappa - mean(g))^2
+
+    `s_logit` is the **raw risk logit**, not a probability, and `tau` is a
+    free threshold in the same units. See DEFAULT_GATE_T for why gating on
+    the squashed score makes the coverage target unreachable.
     """
-    g = torch.sigmoid((tau - s) / T)
+    g = torch.sigmoid((tau - s_logit) / T)
     num = (g * incorrect).sum()
     den = g.sum().clamp_min(1e-6)
     selective_risk = num / den
@@ -69,7 +97,7 @@ def soft_selective_risk_loss(
 
 
 def aurc_surrogate_loss(
-    s: torch.Tensor,
+    s_logit: torch.Tensor,
     incorrect: torch.Tensor,
     taus: torch.Tensor,
     kappa_grid: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
@@ -79,10 +107,13 @@ def aurc_surrogate_loss(
     """Loss 2 (§3.3): sum Loss-1 over a grid of target coverages, so a
     single score is trained to be good across the whole risk-coverage
     curve rather than at one operating point. `taus` is a per-kappa
-    learnable threshold vector, same length as `kappa_grid`."""
-    total = s.new_zeros(())
+    learnable threshold vector, same length as `kappa_grid`, in logit
+    units (see `soft_selective_risk_loss`)."""
+    total = s_logit.new_zeros(())
     for tau_k, kappa in zip(taus, kappa_grid):
-        total = total + soft_selective_risk_loss(s, incorrect, tau_k, kappa, T=T, lam=lam)
+        total = total + soft_selective_risk_loss(
+            s_logit, incorrect, tau_k, kappa, T=T, lam=lam
+        )
     return total / len(kappa_grid)
 
 

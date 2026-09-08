@@ -118,6 +118,54 @@ row (§1) rather than the best one, and needs the rest of the shift battery
 (Diabetes-130 temporal split, CIFAR-10/100-C) before generalizing beyond
 Electricity specifically.
 
+## Post-fix results (10 seeds, Tier A+C, LightGBM) -- CURRENT
+
+These are the numbers in `results/results.parquet` and
+`paper/tables/*.csv` as of this commit. Both the parquet and the figures
+are now **tracked in git** (see `.gitignore`) so collaborators can see what
+was actually run instead of having to reproduce it first.
+
+**The headline changed.** For the first time in this project an aggregator
+**beats MSP with statistical significance**:
+
+  * **German Credit: `A0_rank` beats `signal_msp`**, mean AURC delta
+    **-0.0082**, Holm-corrected Wilcoxon **p = 0.031** over 10 paired
+    seeds. Note this is the *unsupervised* aggregator (rank/z-score
+    average, no learning at all) -- not the paper's headline A2.
+  * **Electricity (temporal shift): `A2_adaptive_loss3` ties MSP**, delta
+    +0.0011, p = 0.055 -- just short of significance, i.e. statistically
+    indistinguishable. This is the closest any learned aggregator has come
+    to MSP under shift, and it is a direct payoff from two of the fixes
+    (the missing gating intercept, and the ranking loss on raw logits).
+  * **Adult: nothing beats MSP.** Closest is `A1_logreg` at delta +0.0003
+    (p = 0.16), i.e. a tie.
+
+The Friedman ranks make the Tier-A degeneracy visible in the results
+themselves: `signal_msp`, `signal_entropy`, `signal_margin_prob`,
+`signal_margin_logit`, `signal_temp_msp` and the now-fixed
+`signal_energy` all share **exactly** mean rank 4.833, because they are
+rank-equivalent by construction on binary tasks (Friedman
+chi-sq = 58.11, p < 1e-4). Best aggregator rank is `A0_rank` at 8.0.
+
+Still-honest caveats on these numbers:
+
+  1. **Three datasets, not four.** The `diabetes130` 10-seed run did *not*
+     complete -- it was killed when the session ended, roughly 95 minutes
+     in (4h42m CPU). The dataset is registered, verified and runs
+     end-to-end, but it contributes no rows yet. Everything above is
+     Adult + German Credit + Electricity.
+  2. **`loss1` and `loss2` remain unreliable** even after the gate fix.
+     `A2_mlp_loss1` on Electricity is 0.3455 with std 0.0951 and a worst
+     seed of 0.4606 -- above random's 0.3705. Do not put these two in a
+     headline table without either fixing them (a quantile-based tau is
+     the cleanest option) or reporting the variance honestly.
+  3. **A0_rank winning is a mixed message for the paper.** The method that
+     beats MSP is the one with no learning in it, which argues for the
+     "simple and auditable wins" framing rather than for A2 as the
+     contribution.
+  4. Significance is still per-seed Wilcoxon (n=10 paired observations),
+     not the plan's per-instance paired bootstrap -- see simplification 4.
+
 ## Diabetes-130 added (second temporal-shift dataset, plan §4)
 
 `diabetes130` (OpenML did=4541, Strack et al. 2014) is now in the registry
@@ -170,7 +218,9 @@ adjacent boundaries and no gaps.
 
 A dedicated review pass over the signal and aggregator code found seven
 real defects, four of them silently degrading every aggregator result
-reported above. All are fixed, each with a regression test in
+reported above -- plus one trap discovered only by re-measuring after the
+first fix attempt (items 5-6 below), which is why the numbers here come
+from a *second* full battery rather than the first. All are fixed, each with a regression test in
 `tests/test_fixes.py` written against the *symptom* rather than the
 implementation. The pre-fix results are archived at
 `results/results_prefix_archive.parquet` so the before/after comparison
@@ -223,16 +273,43 @@ margins, loss -> 0 for a correct ranking, healthy gradients. The optimised
 ranking is unchanged (sigmoid is monotone, so every pairwise sign is the
 same); only the loss surface differs.
 
-**5. The soft-selective-risk gate was too sharp to train through
-(`T = 0.05`).** `sigmoid((tau - s)/T)` is then a near-step function whose
-derivative falls below 0.018 once `|tau - s| > 0.2`; composed with the
-already-saturating sigmoid on `s`, almost no training point retained a
-usable gradient. Raised to `T = 0.5`.
+**5 and 6. The coverage-targeted losses (Loss 1 / Loss 2) were untrainable
+-- and the obvious fix made it far worse.** Two defects and a trap:
 
-**6. The coverage penalty never bound (`lambda = 1.0`).** Missing a target
-coverage of 0.8 by a full 10 points cost `(0.1)^2 * 1.0 = 0.01`, against a
-selective-risk term of order 0.1-0.2, so a *coverage-targeted* objective
-could ignore its own coverage target essentially for free. Raised to 10.0.
+*The original defects.* The gate temperature was `T = 0.05`, making
+`sigmoid((tau - s)/T)` a near-step function whose derivative falls below
+0.018 once `|tau - s| > 0.2`; composed with the already-saturating sigmoid
+producing `s`, almost no training row retained a usable gradient. And the
+coverage penalty weight was `lambda = 1.0`, so missing a target coverage of
+0.8 by a full 10 points cost `(0.1)^2 * 1.0 = 0.01` against a
+selective-risk term of order 0.1-0.2 -- a *coverage-targeted* objective
+could ignore its own coverage target essentially for free.
+
+*The trap.* Applying the two obvious fixes (`T -> 0.5`, `lambda -> 10.0`)
+while still gating on the **squashed** score is catastrophic. With `s` in
+[0, 1] and `tau` in (0, 1), the maximum attainable `mean(g)` at `T = 0.5`
+is only **0.7170**, below the 0.80 target -- measured directly. The
+coverage penalty is therefore permanently active, and at `lambda = 10` it
+dominates; the optimiser's cheapest way to raise `mean(g)` is to collapse
+the score toward a constant, destroying the ranking. This was caught only
+because the first post-fix 10-seed battery showed `A2_mlp_loss1` on Adult
+going from AURC 0.0317 to **0.1957** -- *worse than random abstention*
+(0.1284) -- and `A2_mlp_loss2` from 0.0303 to 0.2127, with the same
+collapse on German Credit and Electricity.
+
+*The actual fix.* Gate on the **raw logit**, with `tau` a free threshold in
+logit units. The logit is unbounded, so any coverage is reachable
+(max `mean(g)` = 0.978 at `T = 0.5`) while gradients stay healthy, and this
+removes the double-saturation at its source instead of widening `T` to
+compensate for it. `lambda = 10` then binds legitimately. Two regression
+tests pin the property: one asserts the gate can reach a high coverage,
+one asserts loss1/loss2 still yield a usable ranking (AUC > 0.8) rather
+than a collapsed constant.
+
+*Lesson worth carrying:* strengthening a penalty on an **unsatisfiable**
+constraint does not enforce the constraint -- it makes the degenerate
+escape route cheaper than the real objective. Check reachability before
+raising a penalty weight.
 
 **7. `LogRegStackingAggregator` fed unstandardised features to an
 L2-regularised model.** Tier-A signals are probabilities in [0, 1] while

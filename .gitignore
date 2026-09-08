@@ -8,9 +8,18 @@ multirun/
 .hydra/
 *.egg-info/
 .DS_Store
-results/*.parquet
+# Results and figures ARE tracked: they are the shared record of what was
+# actually run, and collaborators cannot see any of it otherwise. The
+# parquet is small (~65KB) and is the single source every table/figure is
+# queried from (plan section 8). Caveat: parquet is binary, so two people
+# running experiments on the same branch will get a merge conflict on it
+# rather than a mergeable diff -- coordinate runs, or re-run and
+# regenerate rather than trying to resolve one by hand.
+#
+# Raw datasets stay out (data_cache/, below): they are large, they are
+# re-fetchable from OpenML by id, and Adult/German Credit/Diabetes-130 are
+# person-level records that there is no reason to redistribute here.
 !results/.gitkeep
-paper/figures/*.png
 !paper/figures/.gitkeep
 paper/*.pdf
 paper/*.aux

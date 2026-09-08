@@ -136,21 +136,18 @@ class _BaseTorchAggregator:
             if self.loss_name == "bce":
                 loss = bce_loss(logit, incorrect)
             elif self.loss_name == "loss1":
-                # Losses 1/2 are defined on the bounded score s in [0, 1]
-                # (the gate compares s against a threshold in the same
-                # units), so they take sigmoid(logit).
+                # Losses 1/2 gate on the RAW logit, with tau a free
+                # threshold in the same units. Gating on sigmoid(logit)
+                # with tau squashed into (0, 1) caps the reachable coverage
+                # at ~0.72, which makes the target unsatisfiable and
+                # collapses the score to a constant -- see DEFAULT_GATE_T
+                # in losses.py.
                 loss = soft_selective_risk_loss(
-                    torch.sigmoid(logit),
-                    incorrect,
-                    torch.sigmoid(self.tau),
-                    kappa=self.target_coverage,
+                    logit, incorrect, self.tau, kappa=self.target_coverage
                 )
             elif self.loss_name == "loss2":
                 loss = aurc_surrogate_loss(
-                    torch.sigmoid(logit),
-                    incorrect,
-                    torch.sigmoid(self.taus),
-                    kappa_grid=self.KAPPA_GRID,
+                    logit, incorrect, self.taus, kappa_grid=self.KAPPA_GRID
                 )
             else:  # loss3
                 # Loss 3 is a *ranking* loss and takes the raw logit, so its

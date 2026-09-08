@@ -246,3 +246,56 @@ def test_a1_logreg_is_invariant_to_feature_rescaling():
         f"A1 logreg ranking changed (rho={rho:.4f}) when an uninformative "
         "column was rescaled => feature standardisation is missing"
     )
+
+
+# --- Bugs 5+6 interaction: an unreachable coverage target ---------------
+
+
+def test_soft_gate_can_reach_the_target_coverage():
+    """The gate must be able to attain the requested coverage.
+
+    Applying a soft gate to the *squashed* score confines both `s` and
+    `tau` to [0, 1], which caps the reachable `mean(g)` at ~0.717 for
+    T=0.5 -- below the default target of 0.8. The coverage penalty is then
+    permanently active, and at lambda=10 it dominates the risk term; the
+    cheapest way to raise `mean(g)` is to collapse the score to a constant,
+    which destroys the ranking (it drove A2_mlp_loss1 on Adult to AURC
+    0.1957, worse than random's 0.1284). Gating on the raw logit removes
+    the cap. This test pins reachability, not any particular formula.
+    """
+    from src.aggregators.losses import DEFAULT_GATE_T
+
+    logit = torch.linspace(-8.0, 8.0, 1000)
+    best = max(
+        torch.sigmoid((tau - logit) / DEFAULT_GATE_T).mean().item()
+        for tau in torch.linspace(-8.0, 8.0, 400)
+    )
+    assert best > 0.9, (
+        f"max reachable coverage is only {best:.4f}; the gate cannot attain "
+        "a high target, so the coverage penalty is unsatisfiable"
+    )
+
+
+def test_coverage_targeted_losses_do_not_collapse_the_ranking():
+    """A2 trained with loss1/loss2 must still rank errors above correct
+    predictions -- i.e. beat a coin flip on a cleanly separable problem."""
+    from sklearn.metrics import roc_auc_score
+
+    from src.aggregators.a2_coverage_loss import MLPAggregator
+
+    rng = np.random.RandomState(0)
+    n = 600
+    signal = rng.randn(n)
+    incorrect = (signal > 1.0).astype(int)  # ~16% error rate, separable
+    correct = 1 - incorrect
+    U = np.column_stack([signal, rng.randn(n)])
+
+    for loss in ("loss1", "loss2"):
+        agg = MLPAggregator(loss=loss, epochs=200, seed=0).fit(U, correct)
+        scores = agg.score(U)
+        auc = roc_auc_score(incorrect, scores)
+        assert auc > 0.8, (
+            f"{loss} produced a near-useless ranking (AUC={auc:.3f}); the "
+            "score has probably collapsed toward a constant"
+        )
+        assert np.std(scores) > 1e-3, f"{loss} scores are constant"
