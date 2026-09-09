@@ -55,17 +55,20 @@ def fetch_openml_dataset(
 
     `drop_cols` removes columns from X *after* caching (so the cache stays a
     faithful copy of the OpenML original). This is not cosmetic: on a
-    temporal dataset, any column that encodes row order -- e.g.
-    Diabetes-130's `encounter_id`, which is monotone in time -- lets a tree
-    model read the time index directly, and because a temporal split puts
-    every test value outside the training range, the model degenerates into
-    a single branch. Such columns must be dropped, not merely ignored.
+    temporal dataset, any column that encodes row order -- e.g. the
+    now-removed Diabetes-130 entry's `encounter_id`, which was monotone in
+    time -- lets a tree model read the time index directly, and because a
+    temporal split puts every test value outside the training range, the
+    model degenerates into a single branch. Such columns must be dropped,
+    not merely ignored. No current registry entry needs this, but the
+    argument stays generic rather than Diabetes-130-specific.
 
     `positive_class` binarises a multiclass target to
-    `(y_raw == positive_class)`. Used for Diabetes-130, whose native target
-    has three levels (`NO` / `>30` / `<30`) but whose standard task in the
-    literature is the binary "readmitted within 30 days" (`<30`) question --
-    which also keeps it comparable to the other (binary) datasets here.
+    `(y_raw == positive_class)`. Was used for Diabetes-130 (dropped from
+    the registry, see PROJECT_STATUS.md), whose native target had three
+    levels (`NO` / `>30` / `<30`) but whose standard task in the literature
+    is the binary "readmitted within 30 days" (`<30`) question. Kept
+    generic for any future multiclass-to-binary dataset.
     """
     cache_path = _openml_frame_cache_path(dataset_id)
     if cache_path.exists():
@@ -156,36 +159,64 @@ REGISTRY = {
         subgroup_cols=[],
         is_temporal=True,
     ),
-    # Diabetes-130 (Strack et al. 2014), the plan's second temporal-shift
-    # dataset (§4). Verified before use, the same way `electricity` was:
-    #   * Row order is time. `encounter_id` is ascending in row order with
-    #     only 4 inversions in 101,765 adjacent pairs (all of them inside
-    #     the first 8 rows), so `is_temporal=True` is justified.
-    #   * `encounter_id` / `patient_nbr` are dropped from X. `encounter_id`
-    #     is monotone in time, which under a temporal split would hand the
-    #     model an explicit time index whose test values all lie outside the
-    #     training range; `patient_nbr` is a bare identity the model could
-    #     memorise (and is itself ~0.54 Spearman-correlated with row order).
-    #   * `weight` is dropped: 96.9% of rows carry the '?' sentinel.
-    #   * KNOWN CAVEAT, not fixable by column choice: patients recur across
-    #     encounters (16,773 patients have >1 encounter, up to 40), so 19.3%
-    #     of test rows belong to a patient also present in D_train∪D_meta.
-    #     This is patient-level leakage in the strict sense, but it is also
-    #     exactly the real deployment situation for a readmission model
-    #     (you *do* see returning patients), and removing it would destroy
-    #     the temporal semantics. Reported, not hidden -- see
-    #     PROJECT_STATUS.md. A first-encounter-only variant is the obvious
-    #     robustness check if a reviewer presses on it.
-    #   * Target binarised to the standard "readmitted <30 days" task,
-    #     keeping it comparable to the other binary datasets.
-    "diabetes130": dict(
-        dataset_id=4541,
-        target_column="readmitted",
-        subgroup_cols=["race", "gender", "age"],
-        is_temporal=True,
-        drop_cols=["encounter_id", "patient_nbr", "weight"],
-        positive_class="<30",
+    # --- Multiclass (K >= 3) datasets ------------------------------------
+    #
+    # Added specifically to test the project's central mechanism claim. On a
+    # *binary* task every Tier-A signal is provably a monotone transform of
+    # every other one (Spearman |rho| = 1.0000, pinned in
+    # tests/test_fixes.py), so Tier A supplies exactly one ranking and no
+    # aggregator over it can differ from MSP. At K >= 3 that degeneracy
+    # provably breaks: top1-minus-top2 in probability space and in logit
+    # space stop being monotone in each other, entropy stops being a
+    # function of the top probability alone, and `logitnorm_msp` becomes
+    # well-defined (it is excluded on binary input). These datasets are
+    # therefore the direct test of "aggregation helps exactly when the
+    # signals are not redundant" -- turning the project's negative result
+    # into a mechanism rather than an unexplained null.
+    #
+    # All three come from curated suites (OpenML-CC18 / Grinsztajn et al.),
+    # per plan §4's requirement that datasets not be hand-assembled, and all
+    # are *smaller* than Adult, so the set runs in a fraction of
+    # Diabetes-130's cost. Ids and shapes were verified directly against
+    # OpenML rather than recalled.
+    #
+    # **They were screened on test-set error count before being admitted**,
+    # which is the binding constraint for selective prediction and is easy
+    # to overlook: a risk-coverage curve is built entirely out of the
+    # *errors* in D_test, so an easy dataset yields a curve made of noise no
+    # matter how many rows it has. Measured with the standard split and base
+    # model: `segment` gave **5** test errors (98.6% accuracy), `pendigits`
+    # **11**, `optdigits` **8**, `texture` **9** -- all rejected as
+    # unusable. `yeast` (89 errors but only 223 test rows) was left out as
+    # too marginal. The three kept:
+    #
+    # None has a natural demographic subgroup column, so they inform RQ1 and
+    # the mechanism question, not RQ4; none is temporal, so they do *not*
+    # address RQ2's shift question -- that slot still needs its own dataset.
+    "wine_quality_white": dict(
+        dataset_id=40498,  # 4898 x 12, K=7, base acc 0.684 -> 232 test errors
+        target_column="Class",
+        subgroup_cols=[],
     ),
+    "letter": dict(
+        dataset_id=6,  # 20000 x 17, K=26, base acc 0.966 -> 102 test errors
+        target_column="class",
+        subgroup_cols=[],
+    ),
+    "satimage": dict(
+        dataset_id=182,  # 6430 x 37, K=6, base acc 0.928 -> 70 test errors
+        target_column="class",
+        subgroup_cols=[],
+    ),
+    # Diabetes-130 (Strack et al. 2014) was registered and run as the plan's
+    # second temporal-shift dataset (§4), but was dropped by explicit
+    # decision: too many incomplete fields for the result to be trusted
+    # (96.9% of rows carried a '?' sentinel for `weight` alone, on top of
+    # the patient-recurrence caveat documented in git history/
+    # PROJECT_STATUS.md). Removed rather than left commented out so a
+    # stale, half-verified entry doesn't linger in the registry; see git
+    # history for the full loader (dataset_id=4541, target="readmitted",
+    # drop_cols=["encounter_id","patient_nbr","weight"]) if reviving it.
 }
 
 

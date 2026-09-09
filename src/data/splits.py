@@ -25,6 +25,7 @@ directly instead of asserted.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from typing import Callable
 
 import numpy as np
@@ -54,8 +55,10 @@ def four_way_split(
     n_test = n - n_train - n_meta - n_cal
 
     if temporal:
-        # Split by row order (time), never randomly. §4: Electricity,
-        # Diabetes-130 temporal shift datasets rely on this.
+        # Split by row order (time), never randomly. §4: Electricity is the
+        # active temporal-shift dataset relying on this (Diabetes-130 was
+        # also registered for this but later dropped from the project --
+        # see PROJECT_STATUS.md).
         idx = np.arange(n)
     else:
         rng = np.random.RandomState(seed)
@@ -106,6 +109,14 @@ def cross_fitted_signals(
     indices; `compute_signals_fn(model, idx)` must return an (len(idx), m)
     signal matrix for those same absolute indices. Row order of the
     returned array matches `pool_idx` order (not fold order).
+
+    `fit_model_fn` may optionally accept a second argument, the fold index
+    `k`, so a caller can give each fold's model its own derived seed.
+    Without that, every fold model shares one `random_state` and is
+    differentiated only by which rows it sees -- which leaves the K models
+    less independent than intended (their row/column subsampling draws all
+    follow the same pattern). Passing the fold index is backward
+    compatible: single-argument `fit_model_fn`s still work unchanged.
     """
     n = len(pool_idx)
     if y_pool is not None:
@@ -115,11 +126,19 @@ def cross_fitted_signals(
         splitter = KFold(n_splits=n_folds, shuffle=True, random_state=seed)
         fold_iter = splitter.split(np.zeros(n))
 
+    # Does the caller want the fold index? Inspect once rather than
+    # try/except per fold, so a genuine TypeError raised *inside* a
+    # two-argument fit function can't be silently swallowed and retried.
+    try:
+        wants_fold = len(inspect.signature(fit_model_fn).parameters) >= 2
+    except (TypeError, ValueError):  # builtins / C-callables expose no signature
+        wants_fold = False
+
     out = None
-    for train_pos, held_pos in fold_iter:
+    for k, (train_pos, held_pos) in enumerate(fold_iter):
         train_abs = pool_idx[train_pos]
         held_abs = pool_idx[held_pos]
-        model = fit_model_fn(train_abs)
+        model = fit_model_fn(train_abs, k) if wants_fold else fit_model_fn(train_abs)
         sig = compute_signals_fn(model, held_abs)
         if out is None:
             out = np.empty((n,) + sig.shape[1:], dtype=sig.dtype)

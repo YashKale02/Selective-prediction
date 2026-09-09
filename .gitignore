@@ -17,9 +17,14 @@ multirun/
 # regenerate rather than trying to resolve one by hand.
 #
 # Raw datasets stay out (data_cache/, below): they are large, they are
-# re-fetchable from OpenML by id, and Adult/German Credit/Diabetes-130 are
-# person-level records that there is no reason to redistribute here.
+# re-fetchable from OpenML by id, and Adult/German Credit are person-level
+# records that there is no reason to redistribute here.
 !results/.gitkeep
+# Per-instance test scores for the paired-bootstrap test (§7). Kept out of
+# git deliberately: they are bulky intermediate artifacts, they are
+# regenerable by re-running the sweep, and the summary parquet plus the
+# committed bootstrap table are the reportable outputs.
+results/raw/
 !paper/figures/.gitkeep
 paper/*.pdf
 paper/*.aux

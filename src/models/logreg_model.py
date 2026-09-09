@@ -16,8 +16,12 @@ from .preprocessing import build_preprocessor
 
 
 class LogRegWrapper(BaseModelWrapper):
-    def __init__(self, seed: int = 0, C: float = 1.0, max_iter: int = 2000):
+    def __init__(
+        self, seed: int = 0, C: float = 1.0, max_iter: int = 2000, n_classes: int | None = None
+    ):
         self.seed = seed
+        # See BaseModelWrapper's docstring on class-space alignment.
+        self.n_classes = n_classes
         self.C = C
         self.max_iter = max_iter
         self.preprocessor = None
@@ -37,7 +41,7 @@ class LogRegWrapper(BaseModelWrapper):
         return self.preprocessor.transform(X)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict_proba(self._transform(X))
+        return self._align_proba(self.model.predict_proba(self._transform(X)))
 
     def logits(self, X: pd.DataFrame) -> np.ndarray:
         Xt = self._transform(X)
@@ -46,8 +50,8 @@ class LogRegWrapper(BaseModelWrapper):
         if raw.ndim == 1:
             z = np.zeros((raw.shape[0], 2), dtype=float)
             z[:, 1] = raw
-            return z
-        return raw
+            return self._align_logits(z)
+        return self._align_logits(raw)
 
     def features(self, X: pd.DataFrame) -> np.ndarray:
         return self._transform(X)

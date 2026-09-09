@@ -111,15 +111,17 @@ anywhere except as a query against that file. `scripts/make_tables.py` and
 
 ## What's real vs. scaffolded — the short version
 
-Four real OpenML datasets (Adult, German Credit, Electricity and
-Diabetes-130, the latter two temporal-shift) have been run end-to-end at
-10 seeds each, through the entire pipeline including cross-fitting,
-conformal calibration, and the statistical tests — this is not a demo on
-synthetic data. The result on both matches the paper plan's own
-pre-registered prediction (§1, RQ2 and §11's risk register): **a properly
-tuned MSP/temperature-scaled-MSP baseline is very hard to beat
-in-distribution**; no aggregator here beats it by a statistically
-significant margin yet on these two datasets. That is not a failure of the
+Three real OpenML datasets (Adult, German Credit, and Electricity, the
+last one temporal-shift) have been run end-to-end at 10 seeds each,
+through the entire pipeline including cross-fitting, conformal
+calibration, and the statistical tests — this is not a demo on synthetic
+data. (Diabetes-130 was registered and attempted as a second shift
+dataset, but was dropped — too many incomplete fields, see
+PROJECT_STATUS.md — before a run ever completed.) The result across all
+three matches the paper plan's own pre-registered prediction (§1, RQ2 and
+§11's risk register): **a properly tuned MSP/temperature-scaled-MSP
+baseline is very hard to beat in-distribution**; no aggregator here beats
+it by a statistically significant margin yet. That is not a failure of the
 implementation — it is the expected in-distribution result the plan
 explicitly tells you to anticipate, and precisely why RQ2 (shift-regime
 dependence) and the conformal-coverage numbers, not raw in-distribution

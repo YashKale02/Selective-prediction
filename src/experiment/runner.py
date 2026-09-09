@@ -40,6 +40,7 @@ PROJECT_STATUS.md for the honest accounting of what remains simplified.
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -109,12 +110,23 @@ def _build_signal_bank(
     return SignalBank(signals)
 
 
-def _fit_model(model_name: str, X, y, seed: int):
-    return MODEL_REGISTRY[model_name](seed=seed).fit(X, y)
+def _fit_model(model_name: str, X, y, seed: int, n_classes: Optional[int] = None):
+    """`n_classes` is the class count of the *whole dataset*, not of `y`.
+    Passing it makes the wrapper emit probability/logit columns for every
+    dataset class even when this particular fit never saw one -- without it,
+    a rare class absent from a split shifts every column above it and
+    label-indexed reads silently return the wrong class. See
+    `BaseModelWrapper`'s docstring."""
+    return MODEL_REGISTRY[model_name](seed=seed, n_classes=n_classes).fit(X, y)
 
 
-def _train_ensemble(model_name: str, X, y, n_members: int, base_seed: int) -> list:
-    return [_fit_model(model_name, X, y, seed=base_seed * 1000 + i) for i in range(n_members)]
+def _train_ensemble(
+    model_name: str, X, y, n_members: int, base_seed: int, n_classes: Optional[int] = None
+) -> list:
+    return [
+        _fit_model(model_name, X, y, seed=base_seed * 1000 + i, n_classes=n_classes)
+        for i in range(n_members)
+    ]
 
 
 def run_experiment(
@@ -127,6 +139,7 @@ def run_experiment(
     n_ensemble_members: int = 5,
     conformal_delta: float = 0.1,
     subgroup_col: Optional[str] = None,
+    raw_out_dir: Optional[str] = None,
 ) -> pd.DataFrame:
     set_seed(seed)
     t_start = time.time()
@@ -149,7 +162,7 @@ def run_experiment(
     # split the base model has not seen (temperature scaling, isotonic
     # calibration residual) and, when Tier B is enabled, to train the
     # disagreement ensemble -- see `held_out_signals` / `ensemble_train`.
-    model_train = _fit_model(model_name, X_train, y_train, seed=seed)
+    model_train = _fit_model(model_name, X_train, y_train, seed=seed, n_classes=n_classes)
     held_out_signals = [
         TemperatureScaledMSPSignal().fit(X_meta, y_meta, model_train),
         CalibrationResidualSignal().fit(X_meta, y_meta, model_train),
@@ -179,7 +192,7 @@ def run_experiment(
     tier_b_names: list[str] = []
     if use_ensemble:
         ensemble_train = _train_ensemble(
-            model_name, X_train, y_train, n_ensemble_members, seed
+            model_name, X_train, y_train, n_ensemble_members, seed, n_classes=n_classes
         )
         tier_b_bank = SignalBank(default_tier_b_bank(ensemble_train))
         tier_b_bank.fit(X_train, y_train, model_train)
@@ -200,9 +213,15 @@ def run_experiment(
     # Tier B is grafted on separately (see above), so it is excluded here.
     cf_tiers = tuple(t for t in tiers if t != "B")
 
-    def fit_model_fn(idx_abs: np.ndarray):
+    def fit_model_fn(idx_abs: np.ndarray, fold: int = 0):
         Xi, yi = ds.X.iloc[idx_abs], ds.y[idx_abs]
-        model = _fit_model(model_name, Xi, yi, seed=seed)
+        # Each fold gets its own derived seed (same `base * 1000 + i`
+        # pattern as `_train_ensemble`). Previously all K fold models were
+        # fit with the outer `seed`, so their subsampling draws followed an
+        # identical pattern and the K models were less independent than the
+        # cross-fitting design intends -- they differed only by which rows
+        # they saw. Distinct data *and* distinct randomness is the point.
+        model = _fit_model(model_name, Xi, yi, seed=seed * 1000 + fold, n_classes=n_classes)
         bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
         bank.fit(Xi, yi, model)
         return {"model": model, "bank": bank}
@@ -232,7 +251,7 @@ def run_experiment(
 
     # --- model_final: deployed model, D_train u D_meta
     X_pool, y_pool_full = ds.X.iloc[pool_idx], y_pool
-    model_final = _fit_model(model_name, X_pool, y_pool_full, seed=seed)
+    model_final = _fit_model(model_name, X_pool, y_pool_full, seed=seed, n_classes=n_classes)
 
     final_bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
     # The cross-fittable part of the bank is fit on the full pool (their own
@@ -288,6 +307,22 @@ def run_experiment(
     rows = []
     runtime_so_far = time.time() - t_start
 
+    # Per-instance test scores, kept only when `raw_out_dir` is set. The
+    # summary rows below are enough for AURC/Wilcoxon, but §7's prescribed
+    # test is a *paired bootstrap over test instances*, which needs the raw
+    # (uncertainty, incorrect) vectors -- see PROJECT_STATUS.md's
+    # simplification about the coarser per-seed Wilcoxon substitute.
+    #
+    # `incorrect_test` is deliberately stored once per (dataset, tiers,
+    # seed) rather than once per method: it depends only on the frozen base
+    # model, so duplicating it across ~22 methods would inflate these files
+    # ~20x for no information. Scores are float32 (the bootstrap only needs
+    # the ordering) and the files are compressed, which keeps a full sweep
+    # at a few MB instead of the ~200MB a per-method long-format parquet
+    # would cost -- these are intermediate artifacts, so they are
+    # gitignored while the summary parquet stays the tracked source.
+    raw_scores: dict[str, np.ndarray] = {}
+
     def _row(cov=np.nan, risk=np.nan, accuracy=np.nan, n_accepted=np.nan, subgroup="overall",
               value=np.nan, method=""):
         return dict(
@@ -310,6 +345,8 @@ def run_experiment(
         )
 
     def add_rows(method: str, uncertainty_test: np.ndarray, extra_conformal: Optional[dict] = None):
+        if raw_out_dir is not None:
+            raw_scores[method] = np.asarray(uncertainty_test, dtype=np.float32)
         for cov in REPORT_COVERAGES:
             risk = risk_at_coverage(uncertainty_test, incorrect_test, cov)
             k = max(1, min(len(uncertainty_test), int(round(cov * len(uncertainty_test)))))
@@ -378,4 +415,66 @@ def run_experiment(
     agg_naive.fit(U_meta_naive_full, correct_meta_naive)
     add_rows("A1_logreg_naive_meta", agg_naive.score(U_test))
 
+    if raw_out_dir is not None:
+        _save_raw_scores(
+            raw_out_dir,
+            dataset_name=dataset_name,
+            model_name=model_name,
+            tiers="".join(sorted(tiers)),
+            seed=seed,
+            methods=list(raw_scores),
+            scores=np.vstack([raw_scores[m] for m in raw_scores]),
+            incorrect=incorrect_test.astype(np.int8),
+        )
+
     return pd.DataFrame(rows)
+
+
+def raw_scores_path(
+    raw_out_dir: str, dataset_name: str, model_name: str, tiers: str, seed: int
+) -> Path:
+    """Canonical path for one run's per-instance scores. The filename
+    carries the full results key `(dataset, base_model, tiers, seed)` so a
+    re-run overwrites its own file rather than accumulating duplicates --
+    the same idempotency property `run_all.py` gives the summary parquet."""
+    return Path(raw_out_dir) / f"{dataset_name}__{model_name}__{tiers}__seed{seed}.npz"
+
+
+def _save_raw_scores(
+    raw_out_dir: str,
+    dataset_name: str,
+    model_name: str,
+    tiers: str,
+    seed: int,
+    methods: list[str],
+    scores: np.ndarray,
+    incorrect: np.ndarray,
+) -> Path:
+    path = raw_scores_path(raw_out_dir, dataset_name, model_name, tiers, seed)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        methods=np.array(methods, dtype=object),
+        scores=scores,
+        incorrect=incorrect,
+        dataset=dataset_name,
+        base_model=model_name,
+        tiers=tiers,
+        seed=seed,
+    )
+    return path
+
+
+def load_raw_scores(path: str | Path) -> dict:
+    """Read back one `_save_raw_scores` file as
+    `{"methods": [...], "scores": (n_methods, n_test), "incorrect": (n_test,), ...}`."""
+    with np.load(path, allow_pickle=True) as z:
+        return {
+            "methods": [str(m) for m in z["methods"]],
+            "scores": z["scores"],
+            "incorrect": z["incorrect"],
+            "dataset": str(z["dataset"]),
+            "base_model": str(z["base_model"]),
+            "tiers": str(z["tiers"]),
+            "seed": int(z["seed"]),
+        }

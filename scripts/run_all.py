@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.experiment.runner import run_experiment  # noqa: E402
 
 RESULTS_PATH = Path(__file__).resolve().parents[1] / "results" / "results.parquet"
+RAW_DIR = Path(__file__).resolve().parents[1] / "results" / "raw"
 
 
 @hydra.main(config_path="../configs", config_name="config", version_base=None)
@@ -56,6 +57,14 @@ def main(cfg: DictConfig) -> None:
             n_ensemble_members=cfg.signals.get("n_ensemble_members", 5),
             conformal_delta=cfg.experiment.conformal_delta,
             subgroup_col=cfg.dataset.get("subgroup_col"),
+            # Per-instance test scores for §7's paired bootstrap. On by
+            # default: the files are small (compressed float32, one shared
+            # `incorrect` vector per run) and gitignored, and without them
+            # the bootstrap test can only be approximated by the coarser
+            # per-seed Wilcoxon.
+            raw_out_dir=(
+                str(RAW_DIR) if cfg.experiment.get("cache_raw_scores", True) else None
+            ),
         )
         all_dfs.append(df)
 

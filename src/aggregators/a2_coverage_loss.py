@@ -79,9 +79,15 @@ class _BaseTorchAggregator:
         self.seed = seed
         self.scaler = _Standardizer()
         self.net: nn.Module | None = None
-        self.tau: nn.Parameter | None = None  # loss1: scalar
-        self.taus: nn.Parameter | None = None  # loss2: vector over KAPPA_GRID
         self.bias: nn.Parameter | None = None  # adaptive-gating output bias
+        # loss1/loss2's threshold tau used to live here as a learned
+        # nn.Parameter. It is now derived fresh each step from the current
+        # batch's logits (see losses.quantile_tau) -- a quantile-based
+        # threshold hits the target coverage by construction, instead of
+        # being trained to approach it via a penalty term that a freely
+        # learned tau could still miss. See losses.py's docstring for the
+        # bug this fixes (loss1/loss2 remained unreliable even after the
+        # earlier gate-on-raw-logit fix).
 
     def _build_net(self, m_in: int) -> nn.Module:
         raise NotImplementedError
@@ -111,13 +117,6 @@ class _BaseTorchAggregator:
         # base error rate (see AdaptiveGatingAggregator._extra_params).
         params += self._extra_params(float(incorrect.mean()))
 
-        if self.loss_name == "loss1":
-            self.tau = nn.Parameter(torch.zeros(()))
-            params.append(self.tau)
-        elif self.loss_name == "loss2":
-            self.taus = nn.Parameter(torch.zeros(len(self.KAPPA_GRID)))
-            params.append(self.taus)
-
         opt = torch.optim.Adam(params, lr=self.lr, weight_decay=self.weight_decay)
         # Cosine annealing from `lr` down to `lr_min`. Training was
         # previously a fixed lr=1e-2 for 300 full-batch steps with no
@@ -136,19 +135,16 @@ class _BaseTorchAggregator:
             if self.loss_name == "bce":
                 loss = bce_loss(logit, incorrect)
             elif self.loss_name == "loss1":
-                # Losses 1/2 gate on the RAW logit, with tau a free
-                # threshold in the same units. Gating on sigmoid(logit)
+                # Losses 1/2 gate on the RAW logit, with tau a quantile of
+                # the current batch's logits (see losses.quantile_tau) --
+                # not a freely learned parameter. Gating on sigmoid(logit)
                 # with tau squashed into (0, 1) caps the reachable coverage
                 # at ~0.72, which makes the target unsatisfiable and
                 # collapses the score to a constant -- see DEFAULT_GATE_T
                 # in losses.py.
-                loss = soft_selective_risk_loss(
-                    logit, incorrect, self.tau, kappa=self.target_coverage
-                )
+                loss = soft_selective_risk_loss(logit, incorrect, kappa=self.target_coverage)
             elif self.loss_name == "loss2":
-                loss = aurc_surrogate_loss(
-                    logit, incorrect, self.taus, kappa_grid=self.KAPPA_GRID
-                )
+                loss = aurc_surrogate_loss(logit, incorrect, kappa_grid=self.KAPPA_GRID)
             else:  # loss3
                 # Loss 3 is a *ranking* loss and takes the raw logit, so its
                 # margins are unbounded -- see `pairwise_ranking_loss`.

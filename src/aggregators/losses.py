@@ -69,10 +69,52 @@ DEFAULT_GATE_T = 0.5
 DEFAULT_COVERAGE_LAMBDA = 10.0
 
 
+def quantile_tau(s_logit: torch.Tensor, kappa: float) -> torch.Tensor:
+    """The coverage-exact threshold: the `kappa`-quantile of the current
+    batch's risk logits, detached from the autograd graph. The gate accepts
+    when `s_logit < tau` (see `soft_selective_risk_loss`), so putting `tau`
+    at the `kappa`-quantile means exactly a `kappa` fraction of the batch
+    has `s_logit` below it, by the definition of a quantile.
+
+    **Bug fix (loss1/loss2 remained unreliable even after the gate fix,
+    §6/PROJECT_STATUS.md).** The gate-on-raw-logit fix made the target
+    coverage *reachable*, but `tau` was still a freely learned
+    `nn.Parameter`, trained jointly with the network by gradient descent
+    against `soft_selective_risk_loss`'s quadratic coverage penalty. That
+    is an indirect, iterative way to hit a target that has a direct,
+    closed-form answer: for a fixed batch of scores, the threshold that
+    puts exactly `kappa` coverage below it *is* that quantile. Measured
+    symptom this replaces: `A2_mlp_loss1` on Electricity had AURC 0.3455
+    with std 0.0951 and a worst seed of 0.4606 -- worse than random
+    abstention (0.3705) -- because a learned `tau` can wander (via the
+    optimiser's own trajectory, the lr schedule, or a bad seed) into a
+    region where the coverage penalty and the risk term trade off badly,
+    especially on small meta-sets (e.g. German Credit's ~150-row D_meta)
+    where a handful of points can shift a learned threshold a lot.
+
+    Using the empirical quantile instead makes `mean(hard-thresholded g)
+    == kappa` true *by construction* every single step, for any network
+    weights -- there is nothing left for a coverage penalty to enforce,
+    which is why `soft_selective_risk_loss` below no longer takes `tau` as
+    an input at all. The remaining softness (the sigmoid gate width `T`)
+    only blurs coverage by a small, symmetric amount around the exact
+    quantile cut -- it does not introduce systematic drift the way a
+    freely learned threshold could.
+
+    Wrapped in `no_grad` deliberately: `tau` is recomputed fresh from
+    whatever the network currently outputs, not optimised itself, so no
+    gradient should flow through the quantile operation back into the
+    network via this path (gradients still flow into the network normally
+    through `s_logit`'s use in the gate and the risk numerator/denominator
+    in `soft_selective_risk_loss`).
+    """
+    with torch.no_grad():
+        return torch.quantile(s_logit, kappa)
+
+
 def soft_selective_risk_loss(
     s_logit: torch.Tensor,
     incorrect: torch.Tensor,
-    tau: torch.Tensor,
     kappa: float,
     T: float = DEFAULT_GATE_T,
     lam: float = DEFAULT_COVERAGE_LAMBDA,
@@ -84,10 +126,14 @@ def soft_selective_risk_loss(
                                            comfortably below tau)
     L = sum g*err / sum g  +  lam * relu(kappa - mean(g))^2
 
-    `s_logit` is the **raw risk logit**, not a probability, and `tau` is a
-    free threshold in the same units. See DEFAULT_GATE_T for why gating on
-    the squashed score makes the coverage target unreachable.
+    `s_logit` is the **raw risk logit**, not a probability. `tau` is no
+    longer a caller-supplied free parameter -- see `quantile_tau` -- it is
+    derived here from `s_logit` itself, so a `kappa`-coverage threshold
+    always exists and the coverage penalty term is now a redundant
+    backstop (it stays near zero by construction) rather than a live
+    constraint fighting the risk term for control of the gradient.
     """
+    tau = quantile_tau(s_logit, kappa)
     g = torch.sigmoid((tau - s_logit) / T)
     num = (g * incorrect).sum()
     den = g.sum().clamp_min(1e-6)
@@ -99,21 +145,19 @@ def soft_selective_risk_loss(
 def aurc_surrogate_loss(
     s_logit: torch.Tensor,
     incorrect: torch.Tensor,
-    taus: torch.Tensor,
     kappa_grid: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9, 1.0),
     T: float = DEFAULT_GATE_T,
     lam: float = DEFAULT_COVERAGE_LAMBDA,
 ) -> torch.Tensor:
     """Loss 2 (§3.3): sum Loss-1 over a grid of target coverages, so a
     single score is trained to be good across the whole risk-coverage
-    curve rather than at one operating point. `taus` is a per-kappa
-    learnable threshold vector, same length as `kappa_grid`, in logit
-    units (see `soft_selective_risk_loss`)."""
+    curve rather than at one operating point. Each `kappa` in the grid
+    gets its own quantile-derived threshold (see `soft_selective_risk_loss`
+    / `quantile_tau`) computed fresh from `s_logit` every call -- there is
+    no longer a persisted per-kappa `taus` parameter to manage."""
     total = s_logit.new_zeros(())
-    for tau_k, kappa in zip(taus, kappa_grid):
-        total = total + soft_selective_risk_loss(
-            s_logit, incorrect, tau_k, kappa, T=T, lam=lam
-        )
+    for kappa in kappa_grid:
+        total = total + soft_selective_risk_loss(s_logit, incorrect, kappa, T=T, lam=lam)
     return total / len(kappa_grid)
 
 

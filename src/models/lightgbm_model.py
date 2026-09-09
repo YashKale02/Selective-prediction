@@ -50,24 +50,32 @@ class LightGBMWrapper(BaseModelWrapper):
         feature_fraction=0.8,
     )
 
-    def __init__(self, seed: int = 0, n_estimators: int = 300, **lgb_kwargs):
+    def __init__(
+        self, seed: int = 0, n_estimators: int = 300, n_classes: int | None = None, **lgb_kwargs
+    ):
         self.seed = seed
+        # Global class count, so predict_proba/logits always return columns
+        # for every dataset class even if this fit never saw one -- see
+        # BaseModelWrapper's docstring on class-space alignment.
+        self.n_classes = n_classes
         self.n_estimators = n_estimators
         self.lgb_kwargs = {**self._RANDOMNESS_DEFAULTS, **lgb_kwargs}
         self.preprocessor = None
         self.model: LGBMClassifier | None = None
-        self.n_classes_: int = 0
+        # Classes actually seen by *this* fit -- distinct from `self.n_classes`,
+        # the whole dataset's class count used for column alignment.
+        self.n_classes_seen_: int = 0
 
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "LightGBMWrapper":
         self.preprocessor = build_preprocessor(X)
         Xt = self.preprocessor.fit_transform(X)
-        self.n_classes_ = int(len(np.unique(y)))
-        objective = "binary" if self.n_classes_ == 2 else "multiclass"
+        self.n_classes_seen_ = int(len(np.unique(y)))
+        objective = "binary" if self.n_classes_seen_ == 2 else "multiclass"
         self.model = LGBMClassifier(
             random_state=self.seed,
             n_estimators=self.n_estimators,
             objective=objective,
-            num_class=self.n_classes_ if objective == "multiclass" else None,
+            num_class=self.n_classes_seen_ if objective == "multiclass" else None,
             verbosity=-1,
             **self.lgb_kwargs,
         )
@@ -79,7 +87,7 @@ class LightGBMWrapper(BaseModelWrapper):
         return self.preprocessor.transform(X)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        return self.model.predict_proba(self._transform(X))
+        return self._align_proba(self.model.predict_proba(self._transform(X)))
 
     def logits(self, X: pd.DataFrame) -> np.ndarray:
         Xt = self._transform(X)
@@ -89,8 +97,8 @@ class LightGBMWrapper(BaseModelWrapper):
             # binary: raw is the positive-class margin -> expand to (n, 2)
             z = np.zeros((raw.shape[0], 2), dtype=float)
             z[:, 1] = raw
-            return z
-        return raw
+            return self._align_logits(z)
+        return self._align_logits(raw)
 
     def features(self, X: pd.DataFrame) -> np.ndarray:
         return self._transform(X)

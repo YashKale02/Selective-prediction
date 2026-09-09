@@ -1,7 +1,0 @@
-# Diabetes-130 (OpenML did=4541), the plan's second temporal-shift dataset
-# (§4). Target binarised to the standard "readmitted within 30 days" task.
-# See src/data/loaders.py:REGISTRY for the verification notes (row order is
-# time; encounter_id/patient_nbr/weight dropped; 19.3% patient recurrence
-# into the test split is a documented, deliberate caveat).
-name: diabetes130
-subgroup_col: race

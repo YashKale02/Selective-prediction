@@ -299,3 +299,70 @@ def test_coverage_targeted_losses_do_not_collapse_the_ranking():
             "score has probably collapsed toward a constant"
         )
         assert np.std(scores) > 1e-3, f"{loss} scores are constant"
+
+
+# --- Bug 8: loss1/loss2's freely learned tau could still miss the target
+# coverage (fixed by deriving tau as a quantile instead) --------------------
+
+
+def test_quantile_tau_hits_target_coverage_by_construction():
+    """`quantile_tau` must put exactly `kappa` fraction of a batch's logits
+    below the returned threshold, for any score distribution -- that is
+    the entire point of deriving it rather than learning it. This is what
+    replaces the coverage *penalty*, which could only ever nudge a freely
+    learned tau toward the target, not guarantee it."""
+    from src.aggregators.losses import quantile_tau
+
+    rng = np.random.RandomState(0)
+    logits = torch.tensor(rng.randn(2000).astype(np.float32))
+    for kappa in (0.5, 0.7, 0.8, 0.95):
+        tau = quantile_tau(logits, kappa)
+        hard_coverage = (logits <= tau).float().mean().item()
+        assert abs(hard_coverage - kappa) < 0.01, (
+            f"kappa={kappa}: hard-thresholded coverage was {hard_coverage:.4f}, "
+            "should equal kappa by construction"
+        )
+
+
+def test_coverage_targeted_losses_do_not_learn_a_tau_parameter():
+    """`MLPAggregator` must not carry a learnable tau/taus after this fix --
+    the threshold is derived from the batch each step, not optimised. A
+    regression here would mean tau silently became a free parameter again,
+    reintroducing the instability quantile_tau was written to remove."""
+    from src.aggregators.a2_coverage_loss import MLPAggregator
+
+    rng = np.random.RandomState(0)
+    n = 300
+    U = np.column_stack([rng.randn(n), rng.randn(n)])
+    correct = (rng.rand(n) > 0.15).astype(int)
+
+    for loss in ("loss1", "loss2"):
+        agg = MLPAggregator(loss=loss, epochs=20, seed=0).fit(U, correct)
+        assert not hasattr(agg, "tau") or agg.tau is None
+        assert not hasattr(agg, "taus") or agg.taus is None
+
+
+def test_electricity_like_shift_does_not_produce_worse_than_random_loss1():
+    """Regression for the measured symptom this fix targets: on Electricity,
+    `A2_mlp_loss1` had AURC 0.3455 (worst seed 0.4606) against random's
+    0.3705 -- i.e. a *learned* tau occasionally did worse than not learning
+    anything at all. Simulate a similarly noisy, imbalanced signal bank and
+    confirm loss1 still produces a usable (better than chance) ranking
+    across several seeds, not just one favorable one."""
+    from sklearn.metrics import roc_auc_score
+
+    from src.aggregators.a2_coverage_loss import MLPAggregator
+
+    for seed in range(5):
+        rng = np.random.RandomState(seed)
+        n = 500
+        signal = rng.randn(n)
+        noise_signal = rng.randn(n) * 3  # a noisy, uninformative second signal
+        incorrect = (signal > 0.8).astype(int)  # ~21% error rate
+        correct = 1 - incorrect
+        U = np.column_stack([signal, noise_signal])
+
+        agg = MLPAggregator(loss="loss1", epochs=150, seed=seed).fit(U, correct)
+        scores = agg.score(U)
+        auc = roc_auc_score(incorrect, scores)
+        assert auc > 0.7, f"seed={seed}: loss1 AUC={auc:.3f}, worse than expected"
