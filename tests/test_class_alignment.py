@@ -105,3 +105,42 @@ def test_binary_path_is_unaffected():
     m = LightGBMWrapper(seed=0, n_classes=2).fit(X, y)
     assert m.predict_proba(X).shape == (len(X), 2)
     assert m.logits(X).shape == (len(X), 2)
+
+
+# --- exclude_signals: the mechanism for controlled signal-ablation runs --
+
+
+def test_build_signal_bank_excludes_named_signal():
+    from src.experiment.runner import _build_signal_bank
+
+    with_it = _build_signal_bank(("A", "C"), n_classes=2)
+    without_it = _build_signal_bank(("A", "C"), n_classes=2, exclude=("trust_score",))
+
+    assert "trust_score" in with_it.names
+    assert "trust_score" not in without_it.names
+    # Nothing else should be dropped as collateral damage.
+    assert set(without_it.names) == set(with_it.names) - {"trust_score"}
+
+
+def test_build_signal_bank_exclude_empty_is_a_no_op():
+    from src.experiment.runner import _build_signal_bank
+
+    a = _build_signal_bank(("A", "C"), n_classes=2)
+    b = _build_signal_bank(("A", "C"), n_classes=2, exclude=())
+    assert a.names == b.names
+
+
+def test_run_experiment_exclude_signals_drops_it_from_every_method_column():
+    """The exclusion must propagate through cross-fitting, the naive-meta
+    path and the final deployment bank alike -- not just one of the three
+    -- or the meta/final column sets would disagree and the assertion in
+    `run_experiment` that checks that would fire."""
+    from src.experiment.runner import run_experiment
+
+    df = run_experiment(
+        "german_credit", tiers=("A", "C"), seed=0, exclude_signals=("trust_score",)
+    )
+    assert "signal_trust_score" not in set(df["method"])
+    # A sibling Tier-C signal must still be present -- this is a targeted
+    # exclusion, not an accidental tier-wide one.
+    assert "signal_knn_distance" in set(df["method"])

@@ -86,7 +86,10 @@ HELD_OUT_FIT_SIGNALS = (TemperatureScaledMSPSignal, CalibrationResidualSignal)
 
 
 def _build_signal_bank(
-    tiers: tuple[str, ...], n_classes: int = 2, ensemble: Optional[list] = None
+    tiers: tuple[str, ...],
+    n_classes: int = 2,
+    ensemble: Optional[list] = None,
+    exclude: tuple[str, ...] = (),
 ) -> SignalBank:
     """Build the cross-fittable part of the signal bank.
 
@@ -94,6 +97,12 @@ def _build_signal_bank(
     fitting them on D_meta. `n_classes` is forwarded to
     `default_tier_a_bank`, which drops `logitnorm_msp` on binary tasks
     (it is provably constant there -- see its docstring).
+
+    `exclude` drops signals by name (e.g. `("trust_score",)`) -- for
+    controlled ablations that ask "does a specific signal explain an
+    aggregator's advantage", without touching any other signal, without
+    retraining the base model, and without a new dataset. Empty by
+    default, so every existing call site is unaffected.
     """
     signals: list[Signal] = []
     if "A" in tiers:
@@ -107,6 +116,8 @@ def _build_signal_bank(
     if "B" in tiers:
         assert ensemble is not None, "Tier B requires an ensemble"
         signals += default_tier_b_bank(ensemble)
+    if exclude:
+        signals = [sig for sig in signals if sig.name not in exclude]
     return SignalBank(signals)
 
 
@@ -140,6 +151,7 @@ def run_experiment(
     conformal_delta: float = 0.1,
     subgroup_col: Optional[str] = None,
     raw_out_dir: Optional[str] = None,
+    exclude_signals: tuple[str, ...] = (),
 ) -> pd.DataFrame:
     set_seed(seed)
     t_start = time.time()
@@ -222,7 +234,7 @@ def run_experiment(
         # cross-fitting design intends -- they differed only by which rows
         # they saw. Distinct data *and* distinct randomness is the point.
         model = _fit_model(model_name, Xi, yi, seed=seed * 1000 + fold, n_classes=n_classes)
-        bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
+        bank = _build_signal_bank(cf_tiers, n_classes=n_classes, exclude=exclude_signals)
         bank.fit(Xi, yi, model)
         return {"model": model, "bank": bank}
 
@@ -240,10 +252,10 @@ def run_experiment(
     is_meta = np.isin(pool_idx, sp.meta_idx)
     U_meta_cf, correct_meta_cf = U_pool[is_meta], correct_pool[is_meta]
 
-    signal_names = _build_signal_bank(cf_tiers, n_classes=n_classes).names
+    signal_names = _build_signal_bank(cf_tiers, n_classes=n_classes, exclude=exclude_signals).names
 
     # --- naive (leaky) meta signals, for the naive-vs-cross-fit ablation
-    naive_bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
+    naive_bank = _build_signal_bank(cf_tiers, n_classes=n_classes, exclude=exclude_signals)
     naive_bank.fit(X_train, y_train, model_train)
     U_meta_naive = naive_bank.transform(X_meta, model_train)
     pred_naive = model_train.predict_proba(X_meta).argmax(axis=1)
@@ -253,7 +265,7 @@ def run_experiment(
     X_pool, y_pool_full = ds.X.iloc[pool_idx], y_pool
     model_final = _fit_model(model_name, X_pool, y_pool_full, seed=seed, n_classes=n_classes)
 
-    final_bank = _build_signal_bank(cf_tiers, n_classes=n_classes)
+    final_bank = _build_signal_bank(cf_tiers, n_classes=n_classes, exclude=exclude_signals)
     # The cross-fittable part of the bank is fit on the full pool (their own
     # geometry-index / no-op fits, as documented in tier_a.py/tier_c.py).
     # Everything in `grafted_names` -- temperature, calibration residual and
