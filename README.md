@@ -104,10 +104,14 @@ anywhere except as a query against that file. `scripts/make_tables.py` and
   single signal, every aggregator, oracle) plus the naive-vs-cross-fit
   ablation, for one `(dataset, seed)`.
 - **Config** (`configs/`, Hydra) and **CLI** (`scripts/run_all.py`).
-- **Paper skeleton** (`paper/main.tex`, IEEEtran, generic conference
-  class) with the structure from project plan §10, and
-  `paper/related_work_gap_table.md` / `paper/references.bib` — both
-  explicitly marked **UNVERIFIED**, see below.
+- **Paper** — `final_ieee/main.tex` is the authoritative submission: a
+  single-focus 6-page IEEE conference paper on the boundary-local
+  redundancy diagnostic (`rho_local`) and why it is needed, self-contained
+  with its own `IEEEtran.cls`, `references.bib` (all entries verified
+  against live sources) and only the figures it actually uses.
+  `paper/tables/` and `paper/figures/` remain the pipeline's general
+  output directory — every analysis script writes there — but `paper/`
+  no longer holds a competing paper draft.
 
 ## What's real vs. scaffolded — the short version
 
@@ -129,16 +133,21 @@ AURC, are the load-bearing claims. See PROJECT_STATUS.md for exactly what
 would need to run next (shift datasets, more seeds, more datasets) to
 actually test that.
 
-## Citations are unverified — do not submit as-is
+## Citations
 
-`paper/references.bib` and `paper/related_work_gap_table.md` are
-transcribed directly from the project plan's own §2, which explicitly
-flagged its citations as "recalled from memory... verify each one... some
-may be misattributed." Nothing in this repository has checked them against
-a live source. Verify every entry before writing the related-work section
-for real.
+`final_ieee/references.bib` (the paper's actual bibliography) carries its
+own header note recording that every entry was checked against a live
+source (arXiv / ACM DL / IEEE Xplore / NeurIPS-ICML-ICLR proceedings) as
+of the date given there. `paper/related_work_gap_table.md` is the older,
+project-plan-era gap analysis this was checked against; it predates the
+current paper's single-focus scope and is kept for that provenance, not
+as a citation list to trust on its own.
 
 ## Repository layout
 
-See `configs/`, `src/`, `scripts/`, `results/`, `paper/`, `tests/` — the
-layout matches project plan §8 exactly.
+`src/`, `scripts/`, `configs/`, `results/`, `tests/` are the reproducible
+pipeline. `paper/tables/` and `paper/figures/` are that pipeline's output
+directory (every `scripts/make_*`/`analyze_*` script writes there).
+`final_ieee/` is the paper itself — self-contained, compiles on its own,
+and is the only LaTeX project in this repository that should be treated
+as a submission draft.
